@@ -1,0 +1,351 @@
+"""Fingerprinted platform findings for the DeadTrees monitor.
+
+The finding rules live here, not in a model prompt: the monitor's model calls
+only file what this module reports. Input is the `operator_status.py` JSON
+snapshot plus the processing-server facts from `host_facts.py`.
+
+A finding is a dict with `severity` (`red` or `yellow`), `surface`,
+`fingerprint` (`dt-status/<surface>/<key>`) and `summary`. A coverage gap is a
+plain string: a check that could not run, reported in the digest, never green.
+Each builder also returns the fingerprint patterns it could not observe this
+run, so a finding filed earlier is kept, not cleared, while its check is down.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from fnmatch import fnmatch
+from typing import Any
+
+DISK_WATCH_PCT = 85
+# janusch's rule (2026-10-02): helicon `/` above 97% is urgent.
+HELICON_URGENT_DISK_PCT = 97
+BACKUP_MAX_AGE_HOURS = 36
+DRAIN_MAX_AGE_HOURS = 12
+# The audit worker writes its status at least every few minutes while it runs.
+AUDIT_WORKER_SILENT_MINUTES = 30
+# A processor only activates a release once its running task ends, so a host
+# may trail main for as long as a drain may last before it counts.
+RELEASE_LAG_HOURS = DRAIN_MAX_AGE_HOURS
+# Flaky surfaces (SSH banner timeouts, one slow page) count only after this
+# many runs in a row, and clear only after as many quiet runs.
+CONFIRM_RUNS = 2
+CI_FAILED = ('failure', 'timed_out', 'startup_failure')
+# Findings that come from a host's own status probe; unobserved while it fails.
+HOST_KEYS = ('disk:*', 'processor', 'restarts', 'oom-killed', 'release', 'api-*', 'cron:*', 'age:*')
+
+
+# Summaries reach a model with Linear write tools, and parts of them (log
+# lines, probe errors, file names) are not ours, so only plain characters pass.
+UNSAFE_RE = re.compile(r"[^\w\s.,:;/@%()=+'`<>?-]")
+
+
+def finding(severity: str, surface: str, key: str, summary: str, *, confirm: bool = False) -> dict[str, Any]:
+	item = {
+		'severity': severity,
+		'surface': surface,
+		'fingerprint': f'dt-status/{surface}/{key}',
+		'summary': ' '.join(UNSAFE_RE.sub(' ', summary).split())[:240],
+	}
+	if confirm:
+		item['confirm'] = True
+	return item
+
+
+def host_label(key: str) -> str:
+	return 'processing-server' if key == 'processing' else key.removeprefix('processing:')
+
+
+def disk_findings(label: str, disks: dict[str, Any]) -> list[dict[str, Any]]:
+	found = []
+	for mount, pct in sorted(disks.items()):
+		pct = int(pct)
+		if label == 'helicon' and mount == '/' and pct > HELICON_URGENT_DISK_PCT:
+			found.append(finding('red', label, f'disk:{mount}', f'helicon `/` is {pct}% full (urgent above {HELICON_URGENT_DISK_PCT}%: stop the processor and requeue its task)'))
+		elif pct >= DISK_WATCH_PCT:
+			# Disks hovering at the line flapped every few runs (deepl1 at 85%).
+			found.append(finding('yellow', label, f'disk:{mount}', f'{label} `{mount}` is {pct}% full', confirm=True))
+	return found
+
+
+def processor_findings(label: str, host: dict[str, Any]) -> list[dict[str, Any]]:
+	processor = host.get('processor') or {}
+	if not processor:
+		return []
+	found = []
+	state = processor.get('state')
+	if state != 'running':
+		found.append(finding('red', label, 'processor', f'{label} processor container is {state or "unknown"} (exit {processor.get("exit")})'))
+	restarts = int(processor.get('restarts') or 0)
+	if restarts > 0:
+		found.append(finding('yellow', label, 'restarts', f'{label} processor restarted {restarts} time(s)'))
+	if processor.get('oom') is True:
+		found.append(finding('yellow', label, 'oom-killed', f'{label} processor container was OOM-killed'))
+	return found
+
+
+def release_findings(label: str, host: dict[str, Any], main_history: list[tuple[str, datetime]] | None, now: datetime) -> list[dict[str, Any]]:
+	"""A host whose activated release has trailed main for longer than a drain may take."""
+	activated = (host.get('release') or {}).get('activated') or ''
+	if not main_history or len(activated) < 7 or activated == 'unknown':
+		return []
+	shas = [sha for sha, _ in main_history]
+	position = next((i for i, sha in enumerate(shas) if sha.startswith(activated)), None)
+	if position == 0:
+		return []
+	if position is None:
+		behind = f'older than the last {len(shas)} main commits'
+		missing_since = main_history[-1][1]
+	else:
+		behind = f'{position} commit(s) behind main'
+		missing_since = main_history[position - 1][1]
+	lag = (now - missing_since).total_seconds() / 3600
+	if lag <= RELEASE_LAG_HOURS:
+		return []
+	return [finding('yellow', label, 'release', f'{label} runs {activated[:7]}, {behind} {shas[0][:7]} for {lag:.0f} h')]
+
+
+def storage_findings(host: dict[str, Any], origin_main: str | None) -> list[dict[str, Any]]:
+	found = []
+	for line in host.get('lines') or []:
+		key, _, value = line.partition('=')
+		if key == 'api_checkout' and origin_main and value and not origin_main.startswith(value[:7]):
+			found.append(finding('yellow', 'storage', 'api-checkout', f'storage API checkout {value[:7]} differs from origin/main {origin_main[:7]}', confirm=True))
+		elif key == 'api':
+			fields = dict(part.partition('=')[::2] for part in value.split())
+			if fields.get('state') != 'running':
+				found.append(finding('red', 'storage', 'api-container', f'API container is {fields.get("state") or "unknown"}'))
+			elif int(fields.get('restarts') or 0) > 0:
+				found.append(finding('yellow', 'storage', 'api-restarts', f'API container restarted {fields["restarts"]} time(s)'))
+		elif key == 'cron' and value.endswith(' missing'):
+			name = value.removesuffix(' missing')
+			found.append(finding('yellow', 'storage', f'cron:{name}', f'storage cron `{name}` is missing'))
+	return found
+
+
+def backup_findings(host: dict[str, Any]) -> list[dict[str, Any]]:
+	found = []
+	for name, age in sorted((host.get('archive_ages_hours') or {}).items()):
+		if float(age) > BACKUP_MAX_AGE_HOURS:
+			found.append(finding('yellow', 'backups', f'age:{name}', f'{name} backup archive is {float(age):.0f} h old'))
+	return found
+
+
+def host_patterns(label: str) -> list[str]:
+	return [f'dt-status/{label}/{key}' for key in HOST_KEYS]
+
+
+def platform_findings(
+	snapshot: dict[str, Any], now: datetime, origin_main: str | None, main_history: list[tuple[str, datetime]] | None = None
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+	found: list[dict[str, Any]] = []
+	gaps: list[str] = []
+	unobserved: list[str] = [] if origin_main else ['dt-status/storage/api-checkout']
+	platform = snapshot.get('platform') or {}
+
+	api = platform.get('api') or {}
+	if api.get('ok') is False:
+		found.append(finding('red', 'api', 'smoke', f'API smoke failed: {api.get("error") or api.get("status")}', confirm=True))
+	elif api.get('ok') is None:
+		gaps.append('api: not checked')
+		unobserved.append('dt-status/api/*')
+
+	database = platform.get('database') or {}
+	if database.get('ok') is not True:
+		gaps.append(f'database summary: {database.get("error") or "not configured"}')
+
+	for key, host in sorted((platform.get('hosts') or {}).items()):
+		label = 'storage' if key == 'storage' else 'backups' if key == 'backups' else host_label(key)
+		if host.get('ok') is None:
+			if host.get('warning') or host.get('skipped'):
+				gaps.append(f'{label}: {host.get("warning") or host.get("skipped")}')
+			unobserved += host_patterns(label)
+			continue
+		if host.get('ok') is False and not host.get('processor'):
+			found.append(finding('yellow', label, 'probe', f'{label} status probe failed: {host.get("error") or "no output"}', confirm=True))
+			unobserved += host_patterns(label)
+			continue
+		found += disk_findings(label, host.get('disks') or {})
+		if key.startswith('processing'):
+			found += processor_findings(label, host) + release_findings(label, host, main_history, now)
+		elif key == 'storage':
+			found += storage_findings(host, origin_main)
+		elif key == 'backups':
+			found += backup_findings(host)
+	return found, gaps, unobserved
+
+
+def deploy_findings(deploy: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+	if not deploy or deploy.get('error'):
+		return [], [f'deploy health: {deploy.get("error") if deploy else "not checked"}'], ['dt-status/deploy/*']
+	found = []
+	if deploy.get('paused'):
+		found.append(finding('yellow', 'deploy', 'paused', 'processor deploy pause marker is present'))
+	if deploy.get('dirty'):
+		found.append(finding('yellow', 'deploy', 'dirty-checkout', f'production checkout is dirty, so auto-deploy refuses: {deploy["dirty"]}'))
+	if deploy.get('log_errors'):
+		found.append(finding('yellow', 'deploy', 'log-error', f'auto-deploy log: {deploy["log_errors"][-1]}'))
+	age = deploy.get('drain_age_hours')
+	if age is not None and float(age) > DRAIN_MAX_AGE_HOURS:
+		found.append(finding('yellow', 'deploy', 'drain-age', f'processor drain has been held for {float(age):.1f} h'))
+	return found, [], []
+
+
+def main_ci_findings(jobs: dict[str, Any] | None) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+	"""Main's migrate or deploy job going red acts at once, without a second run."""
+	if jobs is None:
+		return [], ['main CI: not checked'], ['dt-status/deploy/ci:*']
+	found = []
+	for job, run in sorted(jobs.items()):
+		if (run or {}).get('conclusion') in CI_FAILED:
+			key = job.replace(' ', '-')
+			found.append(finding('red', 'deploy', f'ci:{key}', f"main {job} job {run['conclusion']} at {str(run.get('headSha'))[:7]}: {run.get('url')}"))
+	return found, [], []
+
+
+def local_findings(facts: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+	found: list[dict[str, Any]] = []
+	gaps: list[str] = []
+	unobserved: list[str] = []
+	kills = facts.get('prod_oom_kills')
+	if kills is None:
+		gaps.append('processing-server OOM kills: not checked')
+		unobserved.append('dt-status/processing-server/oom')
+	elif kills:
+		found.append(finding('yellow', 'processing-server', 'oom', f'kernel OOM-killed {", ".join(kills)} in the prod processor cgroup'))
+
+	gpu = facts.get('gpu') or {}
+	if gpu.get('error'):
+		found.append(finding('red', 'processing-server', 'gpu', f'GPU check failed: {gpu["error"]}'))
+	elif not gpu.get('ok'):
+		gaps.append('processing-server GPU: not checked')
+		unobserved.append('dt-status/processing-server/gpu')
+
+	workers = facts.get('workers')
+	if workers is None:
+		gaps.append(f'worker liveness: {facts.get("workers_error") or "not checked"}')
+		unobserved.append('dt-status/*/worker-silent')
+	for worker in workers or []:
+		if worker.get('silent'):
+			# ODM writes no log lines while it reconstructs; a running ODM
+			# container for the task's dataset is alive, not hung (DT-1377).
+			alive = worker.get('odm_running') is True
+			found.append(finding(
+				'yellow' if alive else 'red', worker['name'], 'worker-silent',
+				f'{worker["name"]} worker silent {worker["last_log_age_h"]} h on dataset {worker["dataset_id"]} (task {worker["task_id"]})'
+				+ (', ODM still running' if alive else ''),
+			))
+
+	if not facts.get('frontend'):
+		unobserved.append('dt-status/frontend/*')
+	for url, result in sorted((facts.get('frontend') or {}).items()):
+		if result != 200:
+			found.append(finding('yellow', 'frontend', f'http:{url}', f'{url} returned {result}', confirm=True))
+	return found, gaps, unobserved
+
+
+def audit_worker_findings(status: dict[str, Any] | None, now: datetime) -> list[dict[str, Any]]:
+	"""A paused audit worker (expired login, usage limit) or one that stopped writing its status."""
+	if not status:
+		return []
+	if status.get('state') == 'paused':
+		return [finding('yellow', 'audit-worker', 'paused', f'audit worker paused: {str(status.get("reason"))[:160]}')]
+	if status.get('state') == 'unreadable':
+		return [finding('yellow', 'audit-worker', 'status', f'audit worker status file unreadable: {status.get("reason")}')]
+	try:
+		updated = datetime.fromisoformat(str(status.get('updated_at')))
+	except ValueError:
+		return [finding('yellow', 'audit-worker', 'status', 'audit worker status has no time')]
+	minutes = (now - updated).total_seconds() / 60
+	if minutes > AUDIT_WORKER_SILENT_MINUTES:
+		return [finding('yellow', 'audit-worker', 'silent', f'audit worker silent for {minutes:.0f} min')]
+	return []
+
+
+def build_findings(
+	snapshot: dict[str, Any], facts: dict[str, Any], now: datetime
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+	"""Findings, coverage gaps and the fingerprint patterns not observed."""
+	found, gaps, unobserved = platform_findings(snapshot, now, facts.get('origin_main'), facts.get('main_history'))
+	deploy, deploy_gaps, deploy_unobserved = deploy_findings(facts.get('deploy') or {})
+	ci, ci_gaps, ci_unobserved = main_ci_findings(facts.get('main_ci'))
+	local, local_gaps, local_unobserved = local_findings(facts)
+	local += audit_worker_findings(facts.get('audit_worker'), now)
+	unique = {item['fingerprint']: item for item in found + deploy + ci + local}
+	ordered = sorted(unique.values(), key=lambda item: (item['severity'] != 'red', item['fingerprint']))
+	return ordered, gaps + deploy_gaps + ci_gaps + local_gaps, unobserved + deploy_unobserved + ci_unobserved + local_unobserved
+
+
+def verdict(findings: list[dict[str, Any]]) -> str:
+	if any(item['severity'] == 'red' for item in findings):
+		return 'red'
+	return 'yellow' if findings else 'green'
+
+
+def diff_findings(
+	baseline: dict[str, Any], current: list[dict[str, Any]], unobserved: list[str] = ()
+) -> tuple[dict[str, Any], dict[str, Any]]:
+	"""Compare this run with the filed baseline.
+
+	Returns the delta (`new`, `changed`, `cleared`) and the next baseline. A
+	finding marked `confirm` becomes new only on its second run in a row and
+	clears only after as many quiet runs; others act at once. An active finding
+	whose check did not run (`unobserved`) is kept as it is."""
+	active: dict[str, Any] = dict(baseline.get('active') or {})
+	pending: dict[str, int] = dict(baseline.get('pending') or {})
+	quiet: dict[str, int] = dict(baseline.get('quiet') or {})
+	delta: dict[str, list[Any]] = {'new': [], 'changed': [], 'cleared': []}
+	seen = set()
+	next_pending: dict[str, int] = {}
+	for item in current:
+		key = item['fingerprint']
+		seen.add(key)
+		if key in active:
+			old = active[key]
+			if old['severity'] != item['severity']:
+				delta['changed'].append({**item, 'previous_severity': old['severity']})
+			active[key] = item
+			continue
+		runs = pending.get(key, 0) + 1
+		if item.get('confirm') and runs < CONFIRM_RUNS:
+			next_pending[key] = runs
+			continue
+		delta['new'].append(item)
+		active[key] = item
+	next_quiet: dict[str, int] = {}
+	for key, old in list(active.items()):
+		if key in seen:
+			continue
+		if any(fnmatch(key, pattern) for pattern in unobserved):
+			if key in quiet:
+				next_quiet[key] = quiet[key]
+			continue
+		runs = quiet.get(key, 0) + 1
+		if old.get('confirm') and runs < CONFIRM_RUNS:
+			next_quiet[key] = runs
+			continue
+		delta['cleared'].append(old)
+		del active[key]
+	return (
+		{key: items for key, items in delta.items() if items},
+		{'active': active, 'pending': next_pending, 'quiet': next_quiet},
+	)
+
+
+def hold_back(old: dict[str, Any], new: dict[str, Any], held: set[str]) -> dict[str, Any]:
+	"""The next baseline when the writes for `held` fingerprints failed: those
+	keep their old state, so the next run reports them again at once."""
+	active = dict(new.get('active') or {})
+	pending = dict(new.get('pending') or {})
+	quiet = dict(new.get('quiet') or {})
+	old_active = old.get('active') or {}
+	for key in held:
+		if key in old_active:
+			active[key] = old_active[key]
+			if old_active[key].get('confirm'):
+				quiet[key] = CONFIRM_RUNS - 1
+		elif key in active:
+			if active.pop(key).get('confirm'):
+				pending[key] = CONFIRM_RUNS - 1
+	return {'active': active, 'pending': pending, 'quiet': quiet}

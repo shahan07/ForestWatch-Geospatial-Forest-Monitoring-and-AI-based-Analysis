@@ -1,0 +1,43 @@
+name: AST Grep
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**/*.ts"
+      - "frontend/**/*.tsx"
+      - "api/**/*.py"
+      - "shared/**/*.py"
+      - "processor/**/*.py"
+      - "deadtrees-cli/**/*.py"
+      - "freidata/**/*.py"
+      - "scripts/**/*.py"
+      - "scripts/lint-ast-grep.sh"
+      - "scripts/test-ast-grep-rules.sh"
+      - "ast-grep/**"
+      - "sgconfig.yml"
+      - ".github/workflows/ast-grep.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ast-grep:
+    name: ast-grep
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Test ast-grep rules
+        run: scripts/test-ast-grep-rules.sh
+
+      - name: Run repo-specific AST guardrails
+        run: scripts/lint-ast-grep.sh --format github

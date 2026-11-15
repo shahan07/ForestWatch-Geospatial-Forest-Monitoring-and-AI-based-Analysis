@@ -1,0 +1,280 @@
+# Platform Status Check
+
+Use this playbook for daily or ad-hoc DeadTrees status checks. It is safe to
+track and intentionally contains no credentials.
+
+## Operating Mode
+
+- Start cheap and aggregate first, then drill down only on anomalies.
+- Use the last 24 hours by default unless the user specifies another window.
+- Use UTC for database/server queries and write the final summary in Berlin time
+  unless the audience needs UTC.
+- Do not paste secrets, bearer tokens, database URLs, or passwords into the report.
+- For access paths, use local-only `docs/ops/local-access.md` and
+  `.codex/local-access.md` when present.
+
+## Surfaces
+
+Check the surfaces relevant to the question:
+
+- production database through [trusted analyst access](analyst-database-access.md)
+- processing queue, `v2_statuses`, `v2_logs`, and recent failures
+- storage/API server health and public API contract
+- every configured processing host/container heartbeat when host access is needed
+- frontend smoke behavior when user-visible symptoms are possible
+- PostHog traffic, exceptions, uploads, downloads, and audit events
+- Gmail backup alerts, Zulip reports, and automation summaries when relevant
+- reference exports and backups for data freshness incidents
+
+## Operator Chat Integration
+
+This playbook covers platform health only: database, API, storage, processing,
+PostHog, Zulip, exports, and backups. The broader Operator Chat workflow in
+[`operator-chat.md`](operator-chat.md) wraps this with product-health,
+project-management, Gmail, and handoff checks. Use this playbook as the daily
+full platform check inside that broader operator cadence.
+
+## Fast Preflight
+
+0. Generate the compact operator snapshot when running from the repo:
+
+   ```bash
+   python3 scripts/operator_status.py --write-state --format markdown
+   ```
+
+   Use this as the first-pass summary, then drill down only into warnings,
+   failures, skipped surfaces, or user-visible symptoms. Its optional database
+   probe uses `DEADTREES_OPERATOR_DATABASE_URL` as described in
+   [Operator Chat](operator-chat.md#manual-status-refresh); it does not verify
+   analyst identity.
+
+   To include backup freshness when connected to the university network or VPN,
+   point the backup probe at the backup user. The script uses the documented
+   Borgmatic path on `dtbackup`, lists the latest database and storage archives,
+   and warns when parsed archive timestamps are older than 36 hours:
+
+   ```bash
+   DEADTREES_OPERATOR_BACKUP_HOST=remote-backup@dtbackup \
+     python3 scripts/operator_status.py --write-state --format markdown
+   ```
+
+   When checking backups, also inspect backup-server email alerts for the same
+   operator window, or for the last two months during weekly/full reviews:
+
+   ```text
+   in:anywhere from:dtbackup@gmx.de after:YYYY/MM/DD before:YYYY/MM/DD
+   ```
+
+   Treat the backup surface as fully checked only when both signals are covered:
+   latest Borg archives are fresh, and recent alert emails contain no unresolved
+   `URGENT`, degraded, failed-device, rebuild, or Borgmatic failure signal.
+
+   If the backup probe fails through `dtbackup`, distinguish host reachability
+   from backup-tool access:
+
+   ```bash
+   ssh -o BatchMode=yes -o ConnectTimeout=5 dtbackup 'hostname'
+   ssh -o BatchMode=yes -o ConnectTimeout=5 remote-backup@dtbackup \
+     'set -o pipefail; /home/remote-backup/.local/bin/borgmatic --config /home/remote-backup/.config/borgmatic/database_dump_direct.yaml list \
+      | awk '\''/^[[:alnum:]_.-]+-[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && $1 !~ /[.]checkpoint([.][0-9]+)?$/ { latest=$0 } END { print latest }'\'''
+   ```
+
+   A checkpoint archive is incomplete and must never be used as freshness
+   evidence; the fallback prints the newest completed archive only.
+
+1. Confirm local access files exist if host or MCP access is needed:
+
+   ```bash
+   test -f .codex/config.toml
+   test -f .codex/local-access.md
+   test -d docs/ops
+   ```
+
+2. Run the [analyst preflight](analyst-database-access.md#routine-production-reads)
+   before production SQL. It verifies database, login, role membership and
+   transaction read-only mode. Local access files alone do not establish access;
+   report a failed or unavailable connection as unknown, not zero.
+
+3. Smoke the public API:
+
+   ```bash
+   curl -fsS https://data2.deadtrees.earth/api/v1/openapi.json | jq '.openapi'
+   ```
+
+4. If host checks are needed and approved, use compact SSH probes:
+
+   ```bash
+   ssh -o BatchMode=yes -o ConnectTimeout=5 storage-server 'hostname'
+   ssh -o BatchMode=yes -o ConnectTimeout=5 processing-server 'hostname'
+   ssh -o BatchMode=yes -o ConnectTimeout=5 remote-backup@dtbackup 'hostname'
+   ```
+
+   Keep actual SSH aliases in local access configuration. The compact status helper
+   preserves the existing primary-host variable and accepts labeled additional
+   processor hosts:
+
+   ```bash
+   DEADTREES_OPERATOR_PROCESSING_HOST=primary-ssh-alias \
+   DEADTREES_OPERATOR_PROCESSING_HOSTS=secondary=secondary-ssh-alias,tertiary=tertiary-ssh-alias \
+     python3 scripts/operator_status.py --write-state --format markdown
+   ```
+
+   Labels identify hosts in the snapshot; SSH targets are local machine aliases or
+   `user@host` targets. Repeating the primary target in the additional list does not
+   probe it twice. A missing or failed host/container probe is a coverage gap, not
+   evidence that the worker is stopped, absent, or healthy.
+
+5. Check deploy health read-only on the production checkout, never writing there:
+   the tail of `auto-deploy.log`, `git status --porcelain` (a dirty checkout makes
+   auto-deploy refuse), HEAD against `origin/main`, the `processor-deploy-paused`
+   marker, and the drain files in `.local/processor-control/`. Don't run its
+   scripts: they load the production environment. A lock or "keeping the drain" message is normal while a deploy
+   drains; a refusal, error, pause marker, or a drain older than about 12 hours
+   is a finding. See [operator-chat.md](operator-chat.md#unattended-platform-monitor)
+   for the scheduled version.
+
+## Database Queries
+
+For every full check, include the product workflows in
+[`operator-data-coverage.md`](operator-data-coverage.md): FreiDATA publication,
+audits/flags, output completeness, archive downloads, notification delivery,
+and field activity. Verify role/column access first; missing permissions are
+coverage gaps, never zero activity. Include publication counts and scheduler
+health in the compact report even when the Zulip publication topic is quiet.
+
+Prefer aggregate counts before row-level inspection:
+
+```sql
+select
+	count(*) filter (where created_at >= now() - interval '24 hours') as datasets_created_24h,
+	count(*) filter (where updated_at >= now() - interval '24 hours' and has_error) as statuses_error_24h,
+	count(*) filter (where current_status <> 'idle') as non_idle_now
+from v2_statuses;
+```
+
+```sql
+select is_processing, priority, count(*), min(created_at) as oldest, max(created_at) as newest
+from v2_queue
+group by is_processing, priority
+order by is_processing desc, priority desc;
+```
+
+```sql
+select level, count(*)
+from v2_logs
+where created_at >= now() - interval '24 hours'
+group by level
+order by count(*) desc;
+```
+
+Then inspect specific fingerprints only when counts look wrong.
+
+## Host Checks
+
+Use compact one-shot commands and keep output capped. Run the exact container-state
+check on every processor host; `docker ps` alone can report a zombie container as
+up:
+
+```bash
+docker inspect deadtrees-processor-1 \
+  --format 'State={{.State.Status}} Pid={{.State.Pid}} StartedAt={{.State.StartedAt}} RestartCount={{.RestartCount}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}} Image={{.Image}} Memory={{.HostConfig.Memory}} NanoCPUs={{.HostConfig.NanoCpus}} CgroupParent={{.HostConfig.CgroupParent}}'
+df -h / /data
+tail -n 80 /data/logs/reference_export.log
+tail -n 80 /data/logs/api_container.log
+```
+
+`scripts/operator_status.py` performs this inspection for the legacy primary target
+and each labeled additional processor target. It first uses direct Docker access,
+then may use `sg docker -c` where the already-authorized host account requires its
+existing Docker group in a fresh subshell. It never changes group membership.
+
+For hosts with local GPU, MPS, cgroup, Compose-override, or manual-deployment
+constraints, follow that host's ignored `docs/ops/*` runbook. Record the intended
+configuration separately from current observations: exact PID/state, running image
+or release evidence, effective CPU/memory cgroup values, GPU allocation/reservation,
+resource pressure, and whether deployment automation safely preserves required
+overrides. Monitoring does not enable schedules, deploy, restart services, pull
+images, or repair mismatches.
+
+If processing-server SSH is blocked, use database logs as primary evidence and
+state which processor hosts lacked host-level corroboration.
+
+### Storage And API Host
+
+`data2.deadtrees.earth` and `supabase.deadtrees.earth` are one host. It runs the
+API container and the self-hosted Supabase stack, not a processor. From the
+processing server these read-only routes work:
+
+| Route | Gives | Does not give |
+| --- | --- | --- |
+| `ssh dt-storage-status` | Disk usage, deployed API commit, API container state (start time, restarts, OOM), image build time, which cleanup crons are installed | Anything else: the key is bound to one forced status script |
+| `curl -fsS https://data2.deadtrees.earth/api/v1/openapi.json \| jq -c .info` | API name and version | The deployed commit |
+| `GET https://supabase.deadtrees.earth/auth/v1/settings` with the public anon key from the live frontend bundle | Effective GoTrue settings: `disable_signup`, `mailer_autoconfirm`, enabled providers. `/auth/v1/health` gives the GoTrue version | Env names, SMTP settings, logs |
+| Analyst database login | `public` tables | The `auth` schema (permission denied), so no sign-up counts or auth audit log |
+
+Not reachable from the processing server: the Supabase compose folder and its
+env, API container logs and Brevo errors, nginx logs and config, the container
+list and backups on that host. No other processing-server key has a verified
+shell login there (the `dendro` login with the legacy storage key is refused).
+These need a session on the operator's Mac, which logs in as `dendro`; keep such
+a pass read-only and list env key names, never values.
+
+## Backup Checks
+
+The platform monitor (every 30 minutes in working hours, every two hours
+otherwise) probes backup freshness (see
+[Operator Chat](operator-chat.md#unattended-platform-monitor)). For a manual check,
+combine the live Borg freshness probe with a bounded Gmail alert search. See [`database-backups.md`](database-backups.md) for the
+backup architecture, success contract, validation, and rollback procedures.
+
+Checklist:
+
+1. Run the Borg freshness probe with `DEADTREES_OPERATOR_BACKUP_HOST=remote-backup@dtbackup`.
+2. Search backup-server alert email from `dtbackup@gmx.de` for the check window.
+3. If any alert mentions degraded RAID, failed devices, rebuild activity, or
+   Borgmatic/backup failures, verify current host state and current archives
+   before reporting backups as healthy.
+
+Use this two-month audit query when checking whether backup-server alerting has
+reported bigger issues:
+
+```text
+in:anywhere from:dtbackup@gmx.de after:YYYY/MM/DD before:YYYY/MM/DD
+```
+
+Then narrow likely incidents with:
+
+```text
+in:anywhere from:dtbackup@gmx.de after:YYYY/MM/DD before:YYYY/MM/DD (URGENT OR Failed OR Degraded OR Rebuild OR "Device Failed" OR "Time Out Error")
+in:anywhere after:YYYY/MM/DD before:YYYY/MM/DD (borgmatic OR "remote-backup" OR database_dump OR pg_dump) (failed OR failure OR error OR warning OR cron)
+```
+
+Interpretation guide:
+
+- `RaidAlert-URGENT`, `Volume Degraded`, `RaidSet Degraded`, or `Device Failed`
+  is a real storage incident until host-side state proves recovery.
+- `Start Rebuilding`, `HotSpare Used`, and `Complete Rebuild` describe the
+  recovery sequence; confirm current `/proc/mdstat`, `/mnt/raid` mount, and
+  latest Borg archives before closing the incident.
+- monthly `raid_scrub_check.sh` cron emails that only say scrubs started are
+  informational unless followed by error output or RAID alerts.
+
+## Final Report
+
+Include:
+
+- overall status: green, yellow, or red
+- window checked with concrete dates/times
+- upload/processing throughput counts
+- failures and stuck queues with dataset IDs where useful
+- API/storage/frontend/PostHog/Zulip/export status as checked
+- per-processor host identity, exact container PID/state, image/release evidence,
+  resource observations, and explicit host-specific coverage gaps
+- backups status, including Borg archive freshness and backup-alert email review
+- skipped or blocked surfaces
+- confidence and one improvement for the next check
+
+Use `green` only when all checked surfaces look normal. Use `yellow` for warnings,
+stale jobs, missing signals, or server-side concerns. Use `red` for outages,
+blocked processing, stale user-facing exports, critical storage pressure, or
+multi-user impact.

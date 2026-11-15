@@ -1,0 +1,145 @@
+import { useEffect, useRef, useCallback } from "react";
+import { SATELLITE_MAP_STYLE } from "../../../hooks/useDatasetDetailsMapProvider";
+import type BaseLayer from "ol/layer/Base";
+import LayerGroup from "ol/layer/Group";
+import TileLayer from "ol/layer/Tile";
+import { XYZ } from "ol/source";
+import type { Map as OLMap } from "ol";
+
+import {
+	acquireLibertyBasemapGroup,
+	releaseLibertyBasemapGroup,
+	createWorldImagerySource,
+} from "../../../utils/basemaps";
+
+export type MapStyle = string;
+
+export interface UseBaseLayersOptions {
+	/** Map instance */
+	map: OLMap | null;
+	/** Map style - determines basemap source (satellite-streets-v12 or streets) */
+	mapStyle: string;
+	/** Whether drone imagery (ortho) is visible */
+	showDroneImagery?: boolean;
+	/** Ortho layer ref (from useMapCore) */
+	orthoLayer?: BaseLayer | null;
+}
+
+export interface UseBaseLayersReturn {
+	/** Basemap layer */
+	basemapLayer: BaseLayer | null;
+	/** Set basemap visibility */
+	setBasemapVisible: (visible: boolean) => void;
+	/** Set drone imagery visibility */
+	setDroneImageryVisible: (visible: boolean) => void;
+}
+
+const disposeSource = (source: unknown) => {
+	if (
+		source &&
+		typeof source === "object" &&
+		"dispose" in source &&
+		typeof source.dispose === "function"
+	) {
+		source.dispose();
+	}
+};
+
+/**
+ * Hook for managing base layers (basemap + ortho)
+ * 
+ * Creates and manages:
+ * - Basemap tile layer (satellite wayback or OSM)
+ * - Ortho COG visibility
+ */
+export function useBaseLayers({
+	map,
+	mapStyle,
+	showDroneImagery = true,
+	orthoLayer,
+}: UseBaseLayersOptions): UseBaseLayersReturn {
+	const basemapLayerRef = useRef<BaseLayer | null>(null);
+	const libertyLayerRef = useRef<LayerGroup | null>(null);
+	const waybackLayerRef = useRef<TileLayer<XYZ> | null>(null);
+	const isInitializedRef = useRef(false);
+
+	// Create basemap when map is ready
+	useEffect(() => {
+		if (!map || isInitializedRef.current) return;
+
+		const isSatellite = mapStyle === SATELLITE_MAP_STYLE;
+		// Borrowed from the shared pool; returned (not disposed) in cleanup.
+		const libertyLayer = acquireLibertyBasemapGroup();
+		libertyLayer.setVisible(!isSatellite);
+
+		// Live Esri World Imagery. This map has no imagery-history timeline, so
+		// there is no reason to pay the Wayback archive host's multi-second tile
+		// latency for the same pictures.
+		const waybackLayer = new TileLayer({
+			preload: 0,
+			source: createWorldImagerySource(),
+		});
+		waybackLayer.setVisible(isSatellite);
+
+		// Insert at bottom so basemaps sit below ortho
+		map.getLayers().insertAt(0, libertyLayer);
+		map.getLayers().insertAt(1, waybackLayer);
+		libertyLayerRef.current = libertyLayer;
+		waybackLayerRef.current = waybackLayer;
+		basemapLayerRef.current = isSatellite ? waybackLayer : libertyLayer;
+		isInitializedRef.current = true;
+
+		// Cleanup
+		return () => {
+			if (map) {
+				if (libertyLayerRef.current) {
+					map.removeLayer(libertyLayerRef.current);
+					releaseLibertyBasemapGroup(libertyLayerRef.current);
+					libertyLayerRef.current = null;
+				}
+				if (waybackLayerRef.current) {
+					map.removeLayer(waybackLayerRef.current);
+					disposeSource(waybackLayerRef.current.getSource());
+					waybackLayerRef.current = null;
+				}
+				basemapLayerRef.current = null;
+			}
+			isInitializedRef.current = false;
+		};
+	}, [map, mapStyle]);
+
+	// Update basemap visibility when style changes
+	useEffect(() => {
+		if (!libertyLayerRef.current || !waybackLayerRef.current) return;
+
+		const isSatellite = mapStyle === SATELLITE_MAP_STYLE;
+		libertyLayerRef.current.setVisible(!isSatellite);
+		waybackLayerRef.current.setVisible(isSatellite);
+		// Source is constant — re-setting it here would only throw away the
+		// already-downloaded imagery tiles.
+		basemapLayerRef.current = isSatellite ? waybackLayerRef.current : libertyLayerRef.current;
+	}, [mapStyle]);
+
+	// Update ortho visibility
+	useEffect(() => {
+		if (orthoLayer) {
+			orthoLayer.setVisible(showDroneImagery);
+		}
+	}, [orthoLayer, showDroneImagery]);
+
+	// Visibility setters
+	const setBasemapVisible = useCallback((visible: boolean) => {
+		libertyLayerRef.current?.setVisible(visible && mapStyle !== SATELLITE_MAP_STYLE);
+		waybackLayerRef.current?.setVisible(visible && mapStyle === SATELLITE_MAP_STYLE);
+	}, [mapStyle]);
+
+	const setDroneImageryVisible = useCallback((visible: boolean) => {
+		orthoLayer?.setVisible(visible);
+	}, [orthoLayer]);
+
+	return {
+		basemapLayer: basemapLayerRef.current,
+		setBasemapVisible,
+		setDroneImageryVisible,
+	};
+}

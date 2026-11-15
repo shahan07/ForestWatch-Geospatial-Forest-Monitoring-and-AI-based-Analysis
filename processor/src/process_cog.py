@@ -1,0 +1,127 @@
+from pathlib import Path
+import time
+import uuid
+
+from shared.db import use_client, login_verified
+from shared.settings import settings
+from shared.models import StatusEnum, QueueTask, Cog, Ortho
+from shared.logger import logger
+from .cog.cog import calculate_cog
+from .utils.ssh import delete_superseded_storage_file, push_file_to_storage_server, storage_server_path
+from .utils.local_ortho import ensure_local_ortho
+from .exceptions import AuthenticationError, DatasetError, ProcessingError
+from shared.status import update_status
+from shared.retry import retry_on_transient_error
+from shared.logging import LogContext, LogCategory
+
+
+def process_cog(task: QueueTask, temp_dir: Path):
+	# login with the processor
+	token, user = login_verified(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD)
+	if not user:
+		raise AuthenticationError('Invalid processor token', task_id=task.id)
+
+	# Load dataset
+	try:
+		with use_client(token) as client:
+			response = client.table(settings.orthos_table).select('*').eq('dataset_id', task.dataset_id).execute()
+			ortho = Ortho(**response.data[0])
+	except Exception as e:
+		raise DatasetError(f'Failed to fetch dataset: {str(e)}', dataset_id=task.dataset_id, task_id=task.id)
+
+	# Update status to processing
+	update_status(token, dataset_id=ortho.dataset_id, current_status=StatusEnum.cog_processing)
+
+	try:
+		# Setup paths
+		input_path = Path(temp_dir) / ortho.ortho_file_name
+
+		# Prefer the standardized local ortho from the current pipeline run.
+		ensure_local_ortho(
+			local_path=input_path,
+			ortho_file_name=ortho.ortho_file_name,
+			token=token,
+			dataset_id=task.dataset_id,
+			log_context=LogContext(
+				category=LogCategory.COG,
+				dataset_id=task.dataset_id,
+				user_id=user.id,
+				token=token,
+			),
+		)
+
+		# Get options and setup output paths
+		file_name = f'{ortho.dataset_id}_cog.tif'
+		output_path = Path(temp_dir) / file_name
+
+		# Generate UUID for secure path (makes URL iteration impossible)
+		secure_token = str(uuid.uuid4())
+
+		# Generate COG
+		t1 = time.time()
+		info = calculate_cog(
+			str(input_path),
+			str(output_path),
+			token=token,
+		)
+		logger.info(f'COG created for dataset {ortho.dataset_id}: {info}', extra={'token': token})
+
+		# Push generated COG to UUID-prefixed path
+		storage_server_cog_path = storage_server_path(settings.COG_DIR, secure_token, file_name)
+		push_file_to_storage_server(str(output_path), storage_server_cog_path, token, task.dataset_id)
+		t2 = time.time()
+
+		# Prepare metadata (cog_path includes UUID prefix for security)
+		meta = dict(
+			dataset_id=ortho.dataset_id,
+			cog_file_size=max(1, int((output_path.stat().st_size / 1024 / 1024))),  # in MB
+			cog_file_name=file_name,
+			cog_path=f'{secure_token}/{file_name}',  # UUID-prefixed path for security
+			version=1,
+			cog_info=info.model_dump(),
+			cog_processing_runtime=t2 - t1,
+		)
+		cog = Cog(**meta)
+
+	except Exception as e:
+		raise ProcessingError(str(e), task_type='cog', task_id=task.id, dataset_id=ortho.dataset_id)
+
+	# Save metadata to database
+	try:
+		# Refresh token before database operation
+		token, user = login_verified(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD)
+		if not user:
+			raise AuthenticationError('Token refresh failed', task_id=task.id)
+
+		send_data = {k: v for k, v in cog.model_dump().items() if v is not None}
+
+		# Read the replaced path once: a retried upsert whose first response was lost
+		# would otherwise read the new path and never delete the old COG.
+		with use_client(token) as client:
+			previous = client.table(settings.cogs_table).select('cog_path').eq('dataset_id', ortho.dataset_id).execute()
+		previous_cog_path = previous.data[0]['cog_path'] if previous.data else None
+
+		# upsert is idempotent (on_conflict='dataset_id'), so retrying a transient
+		# disconnect/SSL-handshake timeout cannot create duplicate rows.
+		@retry_on_transient_error
+		def _save_cog_metadata() -> None:
+			with use_client(token) as client:
+				client.table(settings.cogs_table).upsert(send_data, on_conflict='dataset_id').execute()
+
+		_save_cog_metadata()
+
+		# Update final status
+		update_status(token, dataset_id=ortho.dataset_id, current_status=StatusEnum.idle, is_cog_done=True)
+
+	except AuthenticationError:
+		raise
+	except Exception as e:
+		raise DatasetError(f'Failed to save COG metadata: {str(e)}', dataset_id=ortho.dataset_id, task_id=task.id)
+
+	# Only after the database points at the new COG is the old one unreachable.
+	delete_superseded_storage_file(settings.COG_DIR, previous_cog_path, cog.cog_path, token, ortho.dataset_id)
+
+	logger.info(
+		f'Finished creating new COG for dataset {ortho.dataset_id}.',
+		extra={'token': token},
+	)

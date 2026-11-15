@@ -1,0 +1,118 @@
+version: '3'
+services:
+  processor:
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
+    network_mode: host
+    # command: python -m debugpy --listen 0.0.0.0:5678 --wait-for-client -m processor.src.continuous_processor
+    command: python -m processor.src.continuous_processor
+    # Keep the persistent worker alive across crashes and host reboots. Planned
+    # deploys and Docker maintenance drain the worker explicitly before
+    # recreation, so the container should stay up between changes.
+    restart: unless-stopped
+    # Give the graceful-shutdown handler time to re-queue the in-flight task on a
+    # deploy/restart (SIGTERM) before Docker escalates to SIGKILL. Without this,
+    # the default 10s can expire mid-stage and a healthy job gets misclassified as
+    # a crash. See _handle_graceful_shutdown in processor/src/processor.py.
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          # Per-host caps so the same compose file deploys on machines of
+          # different sizes. Override in .env; PROCESSOR_CPU_LIMIT must be <= the
+          # host's CPU core count. Defaults match the original production sizing.
+          cpus: ${PROCESSOR_CPU_LIMIT:-30}
+          memory: ${PROCESSOR_MEMORY_LIMIT:-96G}
+    # Swap limit equal to the memory limit means no swap. Docker otherwise
+    # allows twice the memory limit, so a worker at its cap paged into the
+    # small host swap and stalled the host before the OOM killer ran.
+    memswap_limit: ${PROCESSOR_MEMORY_LIMIT:-96G}
+    runtime: nvidia
+    volumes:
+      - ./processor:/app/processor
+      - ./shared:/app/shared
+      - ${PROCESSOR_ASSETS_DIR:-./assets}:/app/assets:ro
+      # Processor->storage keypair. Override PROCESSOR_SSH_KEY_PATH in .env when
+      # the default ~/.ssh lives on a filesystem the Docker daemon (root) cannot
+      # read — e.g. an NFS home with root-squash; point it at a local-disk path.
+      - ${PROCESSOR_SSH_KEY_PATH:-~/.ssh/processing-to-storage}:/tmp/ssh-keys/processing-to-storage:ro
+      - ${PROCESSOR_SSH_KEY_PATH:-~/.ssh/processing-to-storage}.pub:/tmp/ssh-keys/processing-to-storage.pub:ro
+      # CRITICAL: Mount Docker socket for ODM processing (Docker-in-Docker)
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Stable host identity for default processor worker IDs.
+      - /etc/machine-id:/host/etc/machine-id:ro
+      # Mount /data for processing directory access
+      - /data:/data
+      # Host deploy/maintenance scripts and the worker share drain state here.
+      # Keep this separate from /data because Snap-packaged Docker can expose
+      # /data only inside its mount namespace, making it invisible to host tools.
+      - ${PROCESSOR_CONTROL_DIR:-./.local/processor-control}:/processor-control
+    environment:
+      BASE_DIR: /data
+      # Fewer glibc arenas so the many native threads don't strand freed memory
+      # that the ODM sibling container needs (DT-1376).
+      MALLOC_ARENA_MAX: "4"
+      # Persist the OpenCLIP weights on the /data mount (shared with the API) so
+      # the ~3.9GB download happens once, not on every cron-recreated container.
+      OPENCLIP_CACHE_DIR: /data/assets/openclip_cache
+      # Same for the pinned TCD tree cover checkpoint (~340MB).
+      TCD_MODEL_CACHE_DIR: /data/assets/tcd_model_cache
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
+      STORAGE_SERVER_IP: data2.deadtrees.earth
+      STORAGE_SERVER_USERNAME: dendro
+      STORAGE_SERVER_DATA_PATH: ${STORAGE_SERVER_DATA_PATH}
+      PROCESSOR_USERNAME: processor@deadtrees.earth
+      PROCESSOR_PASSWORD: ${PROCESSOR_PASSWORD}
+      PROCESSOR_WORKER_ID: ${PROCESSOR_WORKER_ID:-}
+      PROCESSOR_IDLE_BACKOFF_SECONDS: ${PROCESSOR_IDLE_BACKOFF_SECONDS:-10}
+      PROCESSOR_LOOP_FAILURE_LIMIT: ${PROCESSOR_LOOP_FAILURE_LIMIT:-3}
+      PROCESSOR_RELEASE_SHA: ${PROCESSOR_RELEASE_SHA:-unknown}
+      PROCESSOR_DRAIN_REQUEST_PATH: /processor-control/drain-request.json
+      PROCESSOR_DRAIN_ACK_PATH: /processor-control/drain-ack.json
+      PROCESSOR_UNHEALTHY_PATH: /processor-control/loop-unhealthy.json
+      # Comma-separated task types this worker refuses to run (e.g. odm_processing).
+      PROCESSOR_TASK_BLACKLIST: ${PROCESSOR_TASK_BLACKLIST:-}
+      # Lowest queue priority this worker claims (4 reserves it for fresh uploads).
+      PROCESSOR_MIN_PRIORITY: ${PROCESSOR_MIN_PRIORITY:-1}
+      SSH_PRIVATE_KEY_PASSPHRASE: ${SSH_PRIVATE_KEY_PASSPHRASE}
+      SSH_PRIVATE_KEY_PATH: /root/.ssh/processing-to-storage
+      SSH_KNOWN_HOSTS_PATH: /app/processor/config/storage_known_hosts
+      DEV_MODE: "false"
+      ODM_AUTO_BOUNDARY: "true"
+      ODM_SKY_REMOVAL: "true"
+      ODM_MAX_NADIR_DEVIATION_DEGREES: "40"
+      # Service role key for accessing auth.users (user email lookup)
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      # Linear integration for processing failure notifications
+      LINEAR_ENABLED: ${LINEAR_ENABLED:-false}
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      # Processing result emails are off until explicitly enabled after deploy.
+      PROCESSING_EMAIL_NOTIFICATIONS_ENABLED: ${PROCESSING_EMAIL_NOTIFICATIONS_ENABLED:-false}
+      BREVO_API_KEY: ${BREVO_API_KEY:-}
+      # Acquisition-date stage: read-only Sentinel-2 block cubes
+      SENTINEL2_S3_ACCESS_KEY_ID: ${SENTINEL2_S3_ACCESS_KEY_ID:-}
+      SENTINEL2_S3_SECRET_ACCESS_KEY: ${SENTINEL2_S3_SECRET_ACCESS_KEY:-}
+      DOY_AUTO_DECIDE: ${DOY_AUTO_DECIDE:-false}
+      # Georeferencing check: optional keyed satellite references
+      MAPTILER_API_KEY: ${MAPTILER_API_KEY:-}
+      MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN:-}
+      AZURE_MAPS_KEY: ${AZURE_MAPS_KEY:-}
+      LINZ_API_KEY: ${LINZ_API_KEY:-}
+      NOTIFICATION_SENDER_EMAIL: ${NOTIFICATION_SENDER_EMAIL:-notifications@deadtrees.earth}
+      NOTIFICATION_SENDER_NAME: ${NOTIFICATION_SENDER_NAME:-DeadTrees}
+      # SSH_KEY_PATH: /root/.ssh/processing-to-storage
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Only set on hosts that reserve a GPU via MPS + EXCLUSIVE_PROCESS; the socket
+      # directory mount lives in that host's local compose override.
+      CUDA_MPS_PIPE_DIRECTORY: ${CUDA_MPS_PIPE_DIRECTORY:-}
+    ports:
+      - "5678:5678"
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools

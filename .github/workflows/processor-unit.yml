@@ -1,0 +1,55 @@
+name: Processor Unit
+
+on:
+  # Heavy suite: run once when a PR opens, and again only when someone adds
+  # the full-ci label (remove and re-add it to rerun after later pushes).
+  # Every push is already covered by the local review run.
+  pull_request:
+    types: [opened, reopened, labeled]
+    paths:
+      - "processor/**"
+      - "shared/**"
+      - "pytest.ini"
+      - ".dockerignore"
+      - ".github/workflows/processor-unit.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Other labels get their own group, so labeling a PR never cancels a running suite.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name || 'run' }}
+  cancel-in-progress: true
+
+jobs:
+  processor-unit:
+    name: processor-unit
+    if: github.event.action != 'labeled' || github.event.label.name == 'full-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build processor test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./processor/Dockerfile
+          target: test
+          load: true
+          tags: deadtrees-processor-test:ci
+          build-args: |
+            TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+          cache-from: type=gha,scope=processor-unit
+          cache-to: type=gha,mode=max,scope=processor-unit
+
+      - name: Run CPU-safe processor unit tests
+        run: |
+          cp .env.example .env
+          docker run --rm \
+            --env-file .env \
+            --env PYTHONPATH=/app \
+            deadtrees-processor-test:ci \
+            python -m pytest -q -m unit processor/tests

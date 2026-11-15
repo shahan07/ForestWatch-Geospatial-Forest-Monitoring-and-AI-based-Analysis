@@ -1,0 +1,178 @@
+services:
+  mailpit:
+    image: axllent/mailpit:latest
+    # SMTP: 1025, HTTP API/UI: 8025
+    # Tests use the service name (`mailpit`) from inside containers.
+    ports:
+      - "${LOCAL_MAILPIT_HTTP_PORT:-8025}:8025"
+      - "${LOCAL_MAILPIT_SMTP_PORT:-1025}:1025"
+    deploy:
+      resources:
+        limits:
+          # QA stacks share the processing server with production; keep them bounded.
+          cpus: '0.5'
+          memory: '256M'
+
+  processor-test:
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
+      target: test
+      # Only include essential files for build (excludes assets via .dockerignore)
+    gpus: all
+    runtime: nvidia
+    env_file:
+      # Load local Supabase keys from repo .env, avoiding accidental shell overrides.
+      - ./.env
+    # healthcheck:
+    #   test: curl --fail http://127.0.0.1:5678/ || exit 1
+    #   interval: 15s
+    #   timeout: 1s
+    #   retries: 5
+    #   start_period: 2s
+    ports:
+      - '${LOCAL_PROCESSOR_DEBUG_PORT:-5678}:5678'
+    volumes:
+      # - ./data:/data # need it for testing (pulling and pushing files to storage server)
+      - ./processor:/app/processor
+      - ./shared:/app/shared
+      - ./assets:/app/assets
+      - ./pytest.ini:/app/pytest.ini:ro
+      # Mount a dedicated local test keypair so processor integration tests can SSH into nginx.
+      - ${LOCAL_TEST_SSH_PRIVATE_KEY_PATH:-./.local/ssh/processing-to-storage}:/tmp/ssh-keys/processing-to-storage:ro
+      - ${LOCAL_TEST_SSH_PUBLIC_KEY_PATH:-./.local/ssh/processing-to-storage.pub}:/tmp/ssh-keys/processing-to-storage.pub:ro
+      - ${LOCAL_TEST_SSH_KNOWN_HOSTS_PATH:-./.local/ssh/known_hosts}:/tmp/ssh-keys/known_hosts:ro
+      # Docker socket for ODM container execution
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - PYTHONPATH=/app
+      - PYTEST_ADDOPTS=--color=yes
+      - STORAGE_SERVER_IP=nginx
+      - STORAGE_SERVER_USERNAME=root
+      - STORAGE_SERVER_DATA_PATH=/data
+      - PROCESSOR_USERNAME=processor@deadtrees.earth
+      # Local seed password only; shared settings has no default for it.
+      - PROCESSOR_PASSWORD=${PROCESSOR_PASSWORD:-processor}
+      - PROCESSOR_WORKER_ID=processor-test
+      - SUPABASE_URL=${SUPABASE_URL_DOCKER:-http://host.docker.internal:54321}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0}
+      - SUPABASE_KEY=${SUPABASE_KEY:-${SUPABASE_SERVICE_ROLE_KEY}}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-${SUPABASE_KEY}}
+      - NGINX_COG_URL=${NGINX_COG_URL:-http://localhost:8080/cogs/v1}
+      - BASE_DIR=/data
+      # Match the mounted SSH key location inside the test container.
+      - SSH_PRIVATE_KEY_PATH=/tmp/ssh-keys/processing-to-storage
+      - SSH_PRIVATE_KEY_PASSPHRASE=
+      - SSH_KNOWN_HOSTS_PATH=/tmp/ssh-keys/known_hosts
+      - ENV=development
+      - MAILPIT_SMTP_HOST=mailpit
+      - MAILPIT_SMTP_PORT=1025
+      - MAILPIT_API_URL=http://mailpit:8025
+
+      # NVIDIA GPU configuration
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    # command: python -m debugpy --listen 0.0.0.0:5678 -c "print('Call the Processor Debugger individually.')"
+    command: tail -f /dev/null
+    deploy:
+      resources:
+        limits:
+          # Keep the placeholder processor service lightweight on local dev machines.
+          cpus: '2'
+          memory: '8G'
+  api-test:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      target: test
+    env_file:
+      # Load local Supabase keys from repo .env, avoiding accidental shell overrides.
+      - ./.env
+    healthcheck:
+      test: curl --fail http://127.0.0.1:8017/ || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 1m30s
+      start_interval: 1s
+    ports:
+      - '${LOCAL_API_HOST_PORT:-8017}:8017'
+      - '${LOCAL_API_DEBUG_PORT:-5679}:5679'
+    volumes:
+      - ${LOCAL_DATA_ROOT:-./data}:/data:rw
+      - ./api:/app/api # dev only, no rebuild needed
+      - ./processor/src:/app/processor/src:ro # CPU imagery contract tests
+      - ./supabase/migrations:/app/supabase/migrations:ro # migration guard tests
+      - ./nginx:/app/nginx:ro # storage configuration tests
+      - ./shared:/app/shared # dev only, no rebuild needed
+      - ./scripts:/app/scripts:ro # import script tests
+      - ./assets:/app/assets
+      - ./pytest.ini:/app/pytest.ini:ro
+      - ./nginx:/app/nginx:ro # nginx config contract tests
+    environment:
+      - PYTHONPATH=/app
+      - UVICORN_HOST=0.0.0.0
+      - UVICORN_PORT=8017
+      - PYTEST_ADDOPTS=--color=yes
+      - SUPABASE_URL=${SUPABASE_URL_DOCKER:-http://host.docker.internal:54321}
+      - SUPABASE_DB_URL=${SUPABASE_DB_URL_DOCKER:-postgresql://postgres:postgres@host.docker.internal:54322/postgres}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0}
+      - SUPABASE_KEY=${SUPABASE_KEY:-${SUPABASE_SERVICE_ROLE_KEY}}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-${SUPABASE_KEY}}
+      - NGINX_COG_URL=${NGINX_COG_URL:-http://localhost:8080/cogs/v1}
+      - BASE_DIR=/data
+      - ENV=development
+      - PROCESSOR_PASSWORD=${PROCESSOR_PASSWORD:-processor}
+      # Mailpit for api/tests/test_notifications.py
+      - MAILPIT_SMTP_HOST=mailpit
+      - MAILPIT_SMTP_PORT=1025
+      - MAILPIT_API_URL=http://mailpit:8025
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    # command: python -m debugpy --listen 0.0.0.0:5679 run.py server --reload=True
+    command: python api/src/run.py server --reload=True
+    deploy:
+      resources:
+        limits:
+          # QA stacks share the processing server with production; keep them bounded.
+          cpus: '4'
+          memory: '4G'
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: test-conf/Dockerfile
+    healthcheck:
+      test: ['CMD', 'service', 'nginx', 'status']
+      interval: 15s
+      timeout: 1s
+      retries: 5
+      start_period: 2s
+    ports:
+      - "${LOCAL_NGINX_HTTP_PORT:-8080}:80"
+      - "${LOCAL_NGINX_SSH_PORT:-2222}:22"
+    volumes:
+      - ${LOCAL_DATA_ROOT:-./data}:/data/:rw
+      # Mount the matching public key so nginx can authorize processor-test SSH access.
+      - ${LOCAL_TEST_SSH_PUBLIC_KEY_PATH:-./.local/ssh/processing-to-storage.pub}:/tmp/ssh-keys/processing-to-storage.pub:ro
+      - ${LOCAL_TEST_SSH_HOST_KEY_PATH:-./.local/ssh/storage-host}:/etc/ssh/ssh_host_ed25519_key:ro
+      - ${LOCAL_TEST_SSH_HOST_PUBLIC_KEY_PATH:-./.local/ssh/storage-host.pub}:/etc/ssh/ssh_host_ed25519_key.pub:ro
+      - ./nginx/test-conf:/etc/nginx/conf.d/:ro
+    deploy:
+      resources:
+        limits:
+          # QA stacks share the processing server with production; keep them bounded.
+          cpus: '1'
+          memory: '1G'
+
+
+  
+
+networks:
+  default:
+    name: ${COMPOSE_NETWORK_NAME:-deadwood_network}
+
+# volumes:
+  # nginx_ssh:  # This can be removed if not used by other services

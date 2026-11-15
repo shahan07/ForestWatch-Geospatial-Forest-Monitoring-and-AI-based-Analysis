@@ -1,0 +1,2915 @@
+import pytest
+from pathlib import Path
+import zipfile
+from shapely import MultiPolygon
+from shapely.geometry import Polygon
+import shutil
+import tempfile
+import geopandas as gpd
+import pyogrio
+import time
+import fiona
+import pandas as pd
+from shared.db import use_client, use_service_client
+from shared.settings import settings
+from fastapi.testclient import TestClient
+from api.src.server import app
+from shared.models import (
+	StatusEnum,
+	LicenseEnum,
+	PlatformEnum,
+	DatasetAccessEnum,
+	LabelPayloadData,
+	LabelSourceEnum,
+	LabelTypeEnum,
+	LabelDataEnum,
+	Dataset,
+	Label,
+	COMBINED_MODEL_CONFIG,
+	DEADWOOD_V1_MODEL_CONFIG,
+	TREECOVER_V1_MODEL_CONFIG,
+)
+from api.src.download.cleanup import cleanup_downloads_directory
+from api.src.download.downloads import (
+	get_unique_archive_name,
+	get_ortho_base_filename,
+	build_dataset_metadata_row,
+	create_consolidated_geopackage,
+	read_export_scope,
+	filter_exportable_dataset_labels,
+)
+from api.src.download.keys import content_version, generate_bundle_job_id
+from shared.labels import create_label_with_geometries
+from shared.testing.fixtures import login
+import json
+
+client = TestClient(app)
+
+
+def _download_test_label(
+	label_id: int,
+	label_data: LabelDataEnum,
+	label_source: LabelSourceEnum = LabelSourceEnum.model_prediction,
+	model_metadata: dict | None = None,
+) -> Label:
+	return Label(
+		id=label_id,
+		dataset_id=1,
+		user_id='test-user',
+		label_source=label_source,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=label_data,
+		model_metadata=model_metadata,
+	)
+
+
+def test_filter_exportable_dataset_labels_keeps_legacy_model_prediction_for_legacy_preference():
+	legacy_label = _download_test_label(1, LabelDataEnum.forest_cover, model_metadata=TREECOVER_V1_MODEL_CONFIG)
+	combined_label = _download_test_label(2, LabelDataEnum.forest_cover, model_metadata=COMBINED_MODEL_CONFIG)
+
+	result = filter_exportable_dataset_labels(
+		[legacy_label, combined_label],
+		{LabelDataEnum.forest_cover: TREECOVER_V1_MODEL_CONFIG},
+	)
+
+	assert [label.id for label in result] == [legacy_label.id]
+
+
+def test_filter_exportable_dataset_labels_skips_model_prediction_without_configured_preference():
+	model_label = _download_test_label(1, LabelDataEnum.forest_cover, model_metadata=TREECOVER_V1_MODEL_CONFIG)
+	visual_label = _download_test_label(
+		2,
+		LabelDataEnum.forest_cover,
+		label_source=LabelSourceEnum.visual_interpretation,
+	)
+
+	result = filter_exportable_dataset_labels([model_label, visual_label], {})
+
+	assert [label.id for label in result] == [visual_label.id]
+
+
+def _local_path(download_path: str) -> Path:
+	"""The prepared file behind a signed export link (/api/v1/exports/<ticket>/<path>)."""
+	relative = download_path.split('/exports/', 1)[1].split('/', 1)[1]
+	return settings.downloads_path / relative
+
+
+def _completed_download_path(status_url: str, auth_token: str, **params) -> str:
+	response = client.get(status_url, params=params, headers={'Authorization': f'Bearer {auth_token}'})
+	assert response.status_code == 200, response.text
+	status = response.json()
+	assert status['status'] == 'completed', status
+	return status['download_path']
+
+
+def _dataset_download_path(dataset_id: int, auth_token: str, **params) -> str:
+	return _completed_download_path(f'/api/v1/download/datasets/{dataset_id}/status', auth_token, **params)
+
+
+def _dataset_zip(dataset_id: int, auth_token: str, **params) -> Path:
+	"""The prepared bundle file the status endpoint currently points to."""
+	return _local_path(_dataset_download_path(dataset_id, auth_token, **params))
+
+
+def _labels_gpkg(dataset_id: int, auth_token: str) -> Path:
+	return _local_path(_completed_download_path(f'/api/v1/download/datasets/{dataset_id}/labels/status', auth_token))
+
+
+def _wait_for_download_completed(dataset_id: int, auth_token: str, *, max_attempts: int = 40, sleep_s: float = 0.25):
+	"""
+	Poll the download status endpoint until it reports completed.
+
+	The download service enforces a per-IP rate limit and runs background tasks; in the test
+	suite we can briefly see non-200 or non-JSON responses. Treat those as transient and
+	keep polling so background jobs don't outlive the test and delete their own inputs.
+	"""
+	last_body = None
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.status_code != 200:
+			last_body = status_response.text
+			time.sleep(sleep_s)
+			continue
+
+		try:
+			status_json = status_response.json()
+		except Exception:
+			last_body = status_response.text
+			time.sleep(sleep_s)
+			continue
+
+		last_body = status_json
+		if isinstance(status_json, dict) and status_json.get('status') == 'completed':
+			return status_json
+
+		time.sleep(sleep_s)
+
+	pytest.fail(f'Dataset processing did not complete within expected time. Last status: {last_body}')
+
+
+@pytest.fixture(scope='function')
+def test_dataset_for_download(auth_token, data_directory, test_file, test_user):
+	"""Create a temporary test dataset for download testing"""
+	with use_client(auth_token) as client:
+		# Copy test file to archive directory
+		file_name = 'test-download.tif'
+		archive_path = data_directory / settings.archive_path / file_name
+		shutil.copy2(test_file, archive_path)
+
+		# Create test dataset with combined metadata fields
+		dataset_data = {
+			'file_name': file_name,
+			'user_id': test_user,
+			'license': LicenseEnum.cc_by.value,
+			'platform': PlatformEnum.drone.value,
+			'authors': ['Test Author'],
+			'aquisition_year': 2024,
+			'aquisition_month': 1,
+			'aquisition_day': 1,
+			'data_access': DatasetAccessEnum.public.value,
+			'additional_information': 'Test dataset',
+		}
+		response = client.table(settings.datasets_table).insert(dataset_data).execute()
+		dataset_id = response.data[0]['id']
+
+		# Create ortho entry
+		ortho_data = {
+			'dataset_id': dataset_id,
+			'ortho_file_name': file_name,
+			'version': 1,
+			'ortho_file_size': max(1, int((archive_path.stat().st_size / 1024 / 1024))),  # in MB
+			'ortho_upload_runtime': 0.1,
+		}
+		# Ortho rows are written by the processor only.
+		with use_service_client() as service_client:
+			service_client.table(settings.orthos_table).insert(ortho_data).execute()
+
+		# Create status entry
+		status_data = {
+			'dataset_id': dataset_id,
+			'current_status': StatusEnum.idle.value,
+			'is_upload_done': True,
+			'is_ortho_done': True,
+		}
+		client.table(settings.statuses_table).insert(status_data).execute()
+
+		try:
+			yield dataset_id
+		finally:
+			# Cleanup database entries
+			client.table(settings.statuses_table).delete().eq('dataset_id', dataset_id).execute()
+			client.table(settings.orthos_table).delete().eq('dataset_id', dataset_id).execute()
+			client.table(settings.datasets_table).delete().eq('id', dataset_id).execute()
+			# Cleanup file
+			if archive_path.exists():
+				archive_path.unlink()
+
+
+@pytest.fixture(scope='function')
+def private_test_dataset_for_download(auth_token, data_directory, test_file, test_user):
+	"""Create a private test dataset for access-control download testing."""
+	with use_client(auth_token) as client:
+		file_name = 'test-private-download.tif'
+		archive_path = data_directory / settings.archive_path / file_name
+		shutil.copy2(test_file, archive_path)
+
+		dataset_data = {
+			'file_name': file_name,
+			'user_id': test_user,
+			'license': LicenseEnum.cc_by.value,
+			'platform': PlatformEnum.drone.value,
+			'authors': ['Test Author'],
+			'aquisition_year': 2024,
+			'aquisition_month': 1,
+			'aquisition_day': 1,
+			'data_access': DatasetAccessEnum.private.value,
+			'additional_information': 'Private dataset for download access testing',
+		}
+		response = client.table(settings.datasets_table).insert(dataset_data).execute()
+		dataset_id = response.data[0]['id']
+
+		ortho_data = {
+			'dataset_id': dataset_id,
+			'ortho_file_name': file_name,
+			'version': 1,
+			'ortho_file_size': max(1, int((archive_path.stat().st_size / 1024 / 1024))),
+			'ortho_upload_runtime': 0.1,
+		}
+		# Ortho rows are written by the processor only.
+		with use_service_client() as service_client:
+			service_client.table(settings.orthos_table).insert(ortho_data).execute()
+
+		status_data = {
+			'dataset_id': dataset_id,
+			'current_status': StatusEnum.idle.value,
+			'is_upload_done': True,
+			'is_ortho_done': True,
+		}
+		client.table(settings.statuses_table).insert(status_data).execute()
+
+		try:
+			yield dataset_id
+		finally:
+			client.table(settings.statuses_table).delete().eq('dataset_id', dataset_id).execute()
+			client.table(settings.orthos_table).delete().eq('dataset_id', dataset_id).execute()
+			client.table(settings.datasets_table).delete().eq('id', dataset_id).execute()
+			if archive_path.exists():
+				archive_path.unlink()
+
+
+@pytest.fixture(scope='function')
+def viewonly_test_dataset_for_download(auth_token, data_directory, test_file, test_user):
+	"""Create a view-only test dataset for download policy testing."""
+	with use_client(auth_token) as client:
+		file_name = 'test-viewonly-download.tif'
+		archive_path = data_directory / settings.archive_path / file_name
+		shutil.copy2(test_file, archive_path)
+
+		dataset_data = {
+			'file_name': file_name,
+			'user_id': test_user,
+			'license': LicenseEnum.cc_by.value,
+			'platform': PlatformEnum.drone.value,
+			'authors': ['Test Author'],
+			'aquisition_year': 2024,
+			'aquisition_month': 1,
+			'aquisition_day': 1,
+			'data_access': DatasetAccessEnum.viewonly.value,
+			'additional_information': 'View-only dataset for download policy testing',
+		}
+		response = client.table(settings.datasets_table).insert(dataset_data).execute()
+		dataset_id = response.data[0]['id']
+
+		ortho_data = {
+			'dataset_id': dataset_id,
+			'ortho_file_name': file_name,
+			'version': 1,
+			'ortho_file_size': max(1, int((archive_path.stat().st_size / 1024 / 1024))),
+			'ortho_upload_runtime': 0.1,
+		}
+		# Ortho rows are written by the processor only.
+		with use_service_client() as service_client:
+			service_client.table(settings.orthos_table).insert(ortho_data).execute()
+
+		status_data = {
+			'dataset_id': dataset_id,
+			'current_status': StatusEnum.idle.value,
+			'is_upload_done': True,
+			'is_ortho_done': True,
+		}
+		client.table(settings.statuses_table).insert(status_data).execute()
+
+		try:
+			yield dataset_id
+		finally:
+			client.table(settings.statuses_table).delete().eq('dataset_id', dataset_id).execute()
+			client.table(settings.orthos_table).delete().eq('dataset_id', dataset_id).execute()
+			client.table(settings.datasets_table).delete().eq('id', dataset_id).execute()
+			if archive_path.exists():
+				archive_path.unlink()
+
+
+def test_download_status_invalid_dataset_id_returns_400(auth_token):
+	"""Status endpoint should return a clean 400 for invalid dataset IDs."""
+	response = client.get(
+		'/api/v1/download/datasets/undefined/status',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 400
+	assert 'Invalid dataset ID' in response.json()['detail']
+
+
+def test_download_dataset_blocks_viewonly_full_download(viewonly_test_dataset_for_download, test_user2):
+	"""Other users cannot download a view-only dataset's orthophoto bundle."""
+	user2_token = login(settings.TEST_USER_EMAIL2, settings.TEST_USER_PASSWORD2, use_cached_session=False)
+	response = client.get(
+		f'/api/v1/download/datasets/{viewonly_test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {user2_token}'},
+	)
+
+	assert response.status_code == 403
+	assert 'download access' in response.json()['detail']
+
+
+def test_owner_downloads_own_viewonly_orthophoto(auth_token, viewonly_test_dataset_for_download):
+	response = client.get(
+		f'/api/v1/download/datasets/{viewonly_test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 200
+
+
+def _download_requests(dataset_id):
+	from shared.db import use_service_client
+
+	with use_service_client() as service_client:
+		rows = (
+			service_client.table('dataset_download_requests')
+			.select('kind,user_id,request_id')
+			.eq('dataset_id', dataset_id)
+			.execute()
+		)
+	return rows.data
+
+
+def test_accepted_download_request_is_recorded_for_reuse_metrics(auth_token, test_dataset_for_download, test_user):
+	"""Accepted bundle and labels requests leave one Factory download row each."""
+	for path, kind in (('dataset.zip', 'dataset'), ('labels.gpkg', 'labels')):
+		response = client.get(
+			f'/api/v1/download/datasets/{test_dataset_for_download}/{path}',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert response.status_code == 200
+
+	rows = _download_requests(test_dataset_for_download)
+	assert sorted(row['kind'] for row in rows) == ['dataset', 'labels']
+	assert {row['user_id'] for row in rows} == {str(test_user)}
+
+
+def test_rejected_download_request_is_not_recorded(viewonly_test_dataset_for_download, test_user2):
+	user2_token = login(settings.TEST_USER_EMAIL2, settings.TEST_USER_PASSWORD2, use_cached_session=False)
+	response = client.get(
+		f'/api/v1/download/datasets/{viewonly_test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {user2_token}'},
+	)
+	assert response.status_code == 403
+	assert _download_requests(viewonly_test_dataset_for_download) == []
+
+
+def _allowed_request_logs(dataset_id):
+	from shared.db import use_service_client
+
+	with use_service_client() as service_client:
+		rows = (
+			service_client.table(settings.logs_table)
+			.select('id')
+			.eq('dataset_id', dataset_id)
+			.eq('category', 'download')
+			.contains('extra', {'event': 'allowed'})
+			.execute()
+		)
+	return rows.data
+
+
+def test_private_request_denied_after_its_rate_limit_log_is_not_recorded(private_test_dataset_for_download, test_user2):
+	"""The rate-limit log is written before access checks, so it never proves an accepted request."""
+	user2_token = login(settings.TEST_USER_EMAIL2, settings.TEST_USER_PASSWORD2, use_cached_session=False)
+	response = client.get(
+		f'/api/v1/download/datasets/{private_test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {user2_token}'},
+	)
+	assert response.status_code == 404
+	assert _allowed_request_logs(private_test_dataset_for_download)
+	assert _download_requests(private_test_dataset_for_download) == []
+
+
+def test_request_without_ortho_output_is_not_recorded(auth_token, test_dataset_for_download):
+	from shared.db import use_service_client
+
+	with use_service_client() as db_client:
+		db_client.table(settings.orthos_table).delete().eq('dataset_id', test_dataset_for_download).execute()
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 404
+	assert _allowed_request_logs(test_dataset_for_download)
+	assert _download_requests(test_dataset_for_download) == []
+
+
+def test_download_request_recording_failure_does_not_block_download(auth_token, test_dataset_for_download, monkeypatch):
+	from api.src.routers import download as download_router
+
+	def unavailable():
+		raise ValueError('SUPABASE_SERVICE_ROLE_KEY is required for service-role database access')
+
+	monkeypatch.setattr(download_router, 'use_service_client', unavailable)
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 200
+
+
+def test_download_labels_allows_viewonly_dataset(auth_token, test_dataset_with_label):
+	"""View-only datasets should still allow labels/predictions download flow."""
+	dataset_id = test_dataset_with_label
+	with use_client(auth_token) as db_client:
+		db_client.rpc(
+			'set_dataset_visibility', {'p_dataset_id': dataset_id, 'p_data_access': DatasetAccessEnum.viewonly.value}
+		).execute()
+
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/labels.gpkg',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 200
+	assert response.json()['status'] in ('processing', 'completed')
+
+
+def test_private_dataset_owner_can_download(auth_token, private_test_dataset_for_download):
+	"""Owner of a private dataset should be able to download it."""
+	response = client.get(
+		f'/api/v1/download/datasets/{private_test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 200
+	assert response.json()['status'] in ('processing', 'completed')
+
+
+def test_private_dataset_non_privileged_user_cannot_download(private_test_dataset_for_download):
+	"""Non-owner without private-view privilege should not access private downloads."""
+	user2_token = login(settings.TEST_USER_EMAIL2, settings.TEST_USER_PASSWORD2, use_cached_session=False)
+	response = client.get(
+		f'/api/v1/download/datasets/{private_test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {user2_token}'},
+	)
+
+	assert response.status_code == 404
+
+
+def test_private_dataset_privileged_user_can_download(private_test_dataset_for_download, test_user2):
+	"""Users with can_view_all_private should be able to download private datasets."""
+	user2_token = login(settings.TEST_USER_EMAIL2, settings.TEST_USER_PASSWORD2, use_cached_session=False)
+	processor_token = login(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD, use_cached_session=False)
+
+	with use_client(processor_token) as processor_client:
+		existing = processor_client.table('privileged_users').select('*').eq('user_id', test_user2).execute().data
+		processor_client.table('privileged_users').delete().eq('user_id', test_user2).execute()
+		processor_client.table('privileged_users').insert(
+			{
+				'user_id': test_user2,
+				'can_upload_private': False,
+				'can_view_all_private': True,
+				'can_audit': False,
+			}
+		).execute()
+
+	try:
+		response = client.get(
+			f'/api/v1/download/datasets/{private_test_dataset_for_download}/dataset.zip',
+			headers={'Authorization': f'Bearer {user2_token}'},
+		)
+		assert response.status_code == 200
+		assert response.json()['status'] in ('processing', 'completed')
+	finally:
+		with use_client(processor_token) as processor_client:
+			processor_client.table('privileged_users').delete().eq('user_id', test_user2).execute()
+			for row in existing:
+				processor_client.table('privileged_users').insert(
+					{
+						'user_id': row['user_id'],
+						'can_upload_private': row['can_upload_private'],
+						'can_view_all_private': row['can_view_all_private'],
+						'can_audit': row['can_audit'],
+					}
+				).execute()
+
+
+def test_download_dataset(auth_token, test_dataset_for_download):
+	"""Test downloading a complete dataset ZIP bundle (now using the async approach)"""
+	# Make initial request to start the download
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format and properties
+	assert response.status_code == 200
+	data = response.json()
+	assert 'status' in data
+	assert 'job_id' in data
+	assert data['job_id'] == str(test_dataset_for_download)
+
+	status_data = _wait_for_download_completed(test_dataset_for_download, auth_token)
+	download_path = status_data['download_path']
+
+	# Test the download redirect endpoint
+	download_response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/download',
+		headers={'Authorization': f'Bearer {auth_token}'},
+		follow_redirects=False,
+	)
+	assert download_response.status_code == 303
+	assert (
+		_local_path(download_response.headers['location'])
+		== _local_path(_dataset_download_path(test_dataset_for_download, auth_token))
+	)
+
+	# Verify the file exists in downloads directory
+	download_file = _dataset_zip(test_dataset_for_download, auth_token)
+	assert download_file.exists()
+
+	# Verify ZIP contents
+	with zipfile.ZipFile(download_file) as zf:
+		files = zf.namelist()
+
+		# Verify expected files
+		assert any(f.startswith('ortho_') and f.endswith('.tif') for f in files)
+		assert 'METADATA.csv' in files
+		assert 'CITATION.cff' in files
+		assert 'LICENSE.txt' in files
+
+
+def test_download_cleanup(auth_token, test_dataset_for_download):
+	"""Test that downloaded files are cleaned up properly"""
+	# Make initial download request and wait for completion
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	_wait_for_download_completed(test_dataset_for_download, auth_token)
+
+	download_file = _dataset_zip(test_dataset_for_download, auth_token)
+	assert download_file.exists()
+
+	# Run cleanup directly
+	cleanup_downloads_directory(max_age_hours=0)
+
+	# Verify cleanup
+	assert not download_file.exists()
+	assert not download_file.parent.exists()
+
+
+def test_download_daily_limit_applies_to_dataset_bundle(auth_token, test_dataset_for_download, test_user, monkeypatch):
+	"""Dataset bundle endpoint should enforce per-user daily limit."""
+	from api.src.routers import download as download_router
+
+	monkeypatch.setattr(download_router, 'DOWNLOAD_REQUESTS_PER_DAY', 2)
+
+	# Download log lines are written by the API with the service role.
+	with use_service_client() as db_client:
+		# Seed two prior counted requests for this user in the rolling daily window.
+		for i in range(2):
+			db_client.table(settings.logs_table).insert(
+				{
+					'name': 'test.download',
+					'level': 'INFO',
+					'message': f'seed {i}',
+					'origin': 'test_download.py',
+					'user_id': test_user,
+					'category': 'download',
+					'extra': {'event': 'allowed', 'count_towards_limit': True, 'endpoint': 'seed'},
+				}
+			).execute()
+
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 429
+	assert 'Daily download limit exceeded' in response.json()['detail']
+
+
+def test_download_daily_limit_does_not_apply_to_status(auth_token, test_dataset_for_download, test_user, monkeypatch):
+	"""Status endpoint should require auth but not count against / be blocked by daily limit."""
+	from api.src.routers import download as download_router
+
+	monkeypatch.setattr(download_router, 'DOWNLOAD_REQUESTS_PER_DAY', 2)
+
+	with use_service_client() as db_client:
+		# Seed above-threshold counted requests for this user.
+		for i in range(3):
+			db_client.table(settings.logs_table).insert(
+				{
+					'name': 'test.download',
+					'level': 'INFO',
+					'message': f'seed-status {i}',
+					'origin': 'test_download.py',
+					'user_id': test_user,
+					'category': 'download',
+					'extra': {'event': 'allowed', 'count_towards_limit': True, 'endpoint': 'seed'},
+				}
+			).execute()
+
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/status',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Not rate limited; nothing was requested, so the job is reported as not being prepared.
+	assert response.status_code == 200
+	assert response.json()['status'] == 'failed'
+
+
+@pytest.fixture(scope='function')
+def test_dataset_with_label(auth_token, test_dataset_for_download, test_user):
+	"""Create a test dataset with label from real GeoPackage data"""
+	# Load geometries from test GeoPackage
+	test_file = Path(__file__).parent.parent.parent.parent / 'assets' / 'test_data' / 'yanspain_crop_124_polygons.gpkg'
+
+	# Read both layers
+	deadwood = gpd.read_file(test_file, layer='standing_deadwood').to_crs(epsg=4326)
+	aoi = gpd.read_file(test_file, layer='aoi').to_crs(epsg=4326)
+
+	# Convert deadwood geometries to MultiPolygon GeoJSON
+	deadwood_geojson = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[[float(x), float(y)] for x, y in poly.exterior.coords]
+				for geom in deadwood.geometry
+				for poly in (geom if isinstance(geom, MultiPolygon) else [geom])
+			]
+		],
+	}
+
+	# Convert AOI to MultiPolygon GeoJSON
+	aoi_geojson = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[[float(x), float(y)] for x, y in poly.exterior.coords]
+				for geom in aoi.geometry
+				for poly in (geom if isinstance(geom, MultiPolygon) else [geom])
+			]
+		],
+	}
+
+	# Create label payload
+	payload = LabelPayloadData(
+		dataset_id=test_dataset_for_download,
+		label_source=LabelSourceEnum.visual_interpretation,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=1,
+		geometry=deadwood_geojson,
+		properties={'source': 'test_data'},
+		# AOI fields
+		aoi_geometry=aoi_geojson,
+		aoi_image_quality=1,
+		aoi_notes='Test AOI from real data',
+	)
+
+	# Create label using the create_label_with_geometries function
+	label = create_label_with_geometries(payload, test_user, auth_token)
+
+	yield test_dataset_for_download
+
+	# Cleanup labels and geometries
+	with use_client(auth_token) as client:
+		# Get all labels for the dataset
+		response = (
+			client.table(settings.labels_table).select('id').eq('dataset_id', test_dataset_for_download).execute()
+		)
+
+		# Delete all associated geometries and labels
+		for label_record in response.data:
+			client.table(settings.deadwood_geometries_table).delete().eq('label_id', label_record['id']).execute()
+			client.table(settings.aois_table).delete().eq('id', label.aoi_id).execute()
+
+		client.table(settings.labels_table).delete().eq('dataset_id', test_dataset_for_download).execute()
+
+
+def test_download_dataset_with_labels(auth_token, test_dataset_with_label):
+	"""Test downloading a dataset that includes labels"""
+	dataset_id = test_dataset_with_label
+
+	# Make initial request
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert data['job_id'] == str(dataset_id)
+
+	# Wait for processing to complete
+	max_attempts = 5
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.json()['status'] == 'completed':
+			break
+		time.sleep(1)
+	else:
+		pytest.fail('Dataset processing did not complete within expected time')
+
+	# Get the actual download
+	download_response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/download',
+		headers={'Authorization': f'Bearer {auth_token}'},
+		follow_redirects=False,
+	)
+	assert download_response.status_code == 303
+
+	# Verify the file exists in downloads directory
+	download_file = _dataset_zip(dataset_id, auth_token)
+	assert download_file.exists()
+
+	# Verify ZIP contents
+	with zipfile.ZipFile(download_file) as zf:
+		files = zf.namelist()
+
+		# Check for expected files
+		assert any(f.startswith('ortho_') and f.endswith('.tif') for f in files)
+		assert any(f.startswith('labels_') and f.endswith('.gpkg') for f in files)
+		assert 'METADATA.csv' in files
+		assert 'CITATION.cff' in files
+		assert 'LICENSE.txt' in files
+
+		# Extract and verify the GeoPackage
+		labels_file = next(f for f in files if f.startswith('labels_') and f.endswith('.gpkg'))
+		with tempfile.TemporaryDirectory() as tmpdir:
+			zf.extract(labels_file, tmpdir)
+			gpkg_path = Path(tmpdir) / labels_file
+
+			# List all available layers in the GeoPackage
+			available_layers = fiona.listlayers(gpkg_path)
+
+			# Verify the deadwood layer exists (with source info in name)
+			deadwood_layer = f'deadwood_{LabelSourceEnum.visual_interpretation.value}'
+			assert deadwood_layer in available_layers
+
+			# Verify layers in GeoPackage
+			gdf_labels = gpd.read_file(gpkg_path, layer=deadwood_layer)
+
+			# Find AOI layer (should start with 'aoi_')
+			aoi_layers = [layer for layer in available_layers if layer.startswith('aoi_')]
+			assert len(aoi_layers) > 0
+			gdf_aoi = gpd.read_file(gpkg_path, layer=aoi_layers[0])
+
+			assert len(gdf_labels) > 0  # Should have deadwood polygons
+			assert len(gdf_aoi) == 1  # Should have one AOI polygon
+
+			# Verify properties
+			assert gdf_labels.iloc[0]['source'] == 'test_data'
+			assert gdf_aoi.iloc[0]['image_quality'] == 1
+			assert gdf_aoi.iloc[0]['notes'] == 'Test AOI from real data'
+
+
+def test_download_dataset_ignores_reference_patch_labels_without_dataset_geometries(
+	auth_token, test_dataset_with_label, test_user
+):
+	"""Dataset ZIP export should skip reference-patch labels instead of failing the bundle."""
+	dataset_id = test_dataset_with_label
+	inserted_label_id = None
+
+	with use_client(auth_token) as db_client:
+		response = (
+			db_client.table(settings.labels_table)
+			.insert(
+				{
+					'dataset_id': dataset_id,
+					'user_id': test_user,
+					'aoi_id': None,
+					'label_source': LabelSourceEnum.reference_patch.value,
+					'label_type': LabelTypeEnum.semantic_segmentation.value,
+					'label_data': LabelDataEnum.deadwood.value,
+					'label_quality': 1,
+				}
+			)
+			.execute()
+		)
+		inserted_label_id = response.data[0]['id']
+
+	try:
+		response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert response.status_code == 200
+
+		_wait_for_download_completed(dataset_id, auth_token)
+
+		download_file = _dataset_zip(dataset_id, auth_token)
+		assert download_file.exists()
+
+		with zipfile.ZipFile(download_file) as zf:
+			files = zf.namelist()
+			assert any(f.startswith('labels_') and f.endswith('.gpkg') for f in files)
+	finally:
+		if inserted_label_id is not None:
+			with use_client(auth_token) as db_client:
+				db_client.table(settings.labels_table).delete().eq('id', inserted_label_id).execute()
+
+
+@pytest.fixture(scope='function')
+def test_dataset_with_label_no_aoi(auth_token, test_dataset_for_download, test_user):
+	"""Create a test dataset with label but without AOI"""
+	# Load geometries from test GeoPackage
+	test_file = Path(__file__).parent.parent.parent.parent / 'assets' / 'test_data' / 'yanspain_crop_124_polygons.gpkg'
+
+	# Read deadwood layer only
+	deadwood = gpd.read_file(test_file, layer='standing_deadwood').to_crs(epsg=4326)
+
+	aoi = gpd.read_file(test_file, layer='aoi').to_crs(epsg=4326)
+
+	# Convert deadwood geometries to MultiPolygon GeoJSON
+	deadwood_geojson = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[[float(x), float(y)] for x, y in poly.exterior.coords]
+				for geom in deadwood.geometry
+				for poly in (geom if isinstance(geom, MultiPolygon) else [geom])
+			]
+		],
+	}
+
+	# Create label payload without AOI
+	payload = LabelPayloadData(
+		dataset_id=test_dataset_for_download,
+		label_source=LabelSourceEnum.visual_interpretation,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=1,
+		geometry=deadwood_geojson,
+		# properties={'source': 'test_data'}, # fix error based by having properties null
+	)
+
+	# Create label using the create_label_with_geometries function
+	label = create_label_with_geometries(payload, test_user, auth_token)
+
+	yield test_dataset_for_download
+
+	# Cleanup labels and geometries
+	with use_client(auth_token) as client:
+		# Get all labels for the dataset
+		response = (
+			client.table(settings.labels_table).select('id').eq('dataset_id', test_dataset_for_download).execute()
+		)
+
+		# Delete all associated geometries and labels
+		for label_record in response.data:
+			client.table(settings.deadwood_geometries_table).delete().eq('label_id', label_record['id']).execute()
+
+		client.table(settings.labels_table).delete().eq('dataset_id', test_dataset_for_download).execute()
+
+
+def test_download_dataset_with_labels_no_aoi(auth_token, test_dataset_with_label_no_aoi):
+	"""Test downloading a dataset that includes labels but no AOI"""
+	dataset_id = test_dataset_with_label_no_aoi
+
+	# Make initial request
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert data['job_id'] == str(dataset_id)
+
+	# Wait for processing to complete
+	max_attempts = 5
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.json()['status'] == 'completed':
+			break
+		time.sleep(1)
+	else:
+		pytest.fail('Dataset processing did not complete within expected time')
+
+	# Get the actual download
+	download_response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/download',
+		headers={'Authorization': f'Bearer {auth_token}'},
+		follow_redirects=False,
+	)
+	assert download_response.status_code == 303
+
+	# Verify the file exists in downloads directory
+	download_file = _dataset_zip(dataset_id, auth_token)
+	assert download_file.exists()
+
+	# Verify ZIP contents
+	with zipfile.ZipFile(download_file) as zf:
+		files = zf.namelist()
+
+		# Check for expected files
+		assert any(f.startswith('ortho_') and f.endswith('.tif') for f in files)
+		assert any(f.startswith('labels_') and f.endswith('.gpkg') for f in files)
+		assert 'METADATA.csv' in files
+		assert 'CITATION.cff' in files
+		assert 'LICENSE.txt' in files
+
+		# Extract and verify the GeoPackage
+		labels_file = next(f for f in files if f.startswith('labels_') and f.endswith('.gpkg'))
+		with tempfile.TemporaryDirectory() as tmpdir:
+			zf.extract(labels_file, tmpdir)
+			gpkg_path = Path(tmpdir) / labels_file
+
+			# Verify labels layer exists and has content
+			deadwood_layer = f'deadwood_{LabelSourceEnum.visual_interpretation.value}'
+
+			# List all available layers to debug
+			available_layers = fiona.listlayers(gpkg_path)
+
+			# Verify deadwood layer exists
+			assert deadwood_layer in available_layers
+
+			# Read the layer with correct naming
+			gdf_labels = gpd.read_file(gpkg_path, layer=deadwood_layer)
+			assert len(gdf_labels) > 0  # Should have deadwood polygons
+			assert gdf_labels.iloc[0]['source'] == 'visual_interpretation'
+
+			# Verify no AOI layer exists
+			assert not any(layer.startswith('aoi_') for layer in available_layers)
+
+			# Verify citation file
+			citation_content = zf.read('CITATION.cff').decode('utf-8')
+			assert 'cff-version: 1.2.0' in citation_content
+			assert 'deadtrees.earth' in citation_content
+
+
+def test_download_labels_with_aoi(auth_token, test_dataset_with_label):
+	"""Test downloading consolidated labels and AOI as single GeoPackage"""
+	dataset_id = test_dataset_with_label
+
+	# Make initial request to start the labels geopackage creation
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/labels.gpkg',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert 'status' in data
+	assert data['job_id'] == f'labels_{dataset_id}'
+
+	# Wait for processing to complete
+	max_attempts = 10
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/labels/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+		if status_data['status'] == 'completed':
+			break
+		time.sleep(1)
+	else:
+		pytest.fail('Labels GeoPackage processing did not complete within expected time')
+
+	# Get the labels file directly from downloads directory
+	labels_file = _labels_gpkg(dataset_id, auth_token)
+	assert labels_file.exists()
+
+	# Verify contents
+	with tempfile.TemporaryDirectory() as tmpdir:
+		gpkg_path = Path(tmpdir) / f'dataset_{dataset_id}_labels.gpkg'
+		shutil.copy2(labels_file, gpkg_path)
+
+		# Get all layers in the consolidated geopackage
+		layers = fiona.listlayers(gpkg_path)
+		print(f'Layers in consolidated geopackage: {layers}')
+
+		# Find deadwood layer (should be deadwood_visual_interpretation based on the test data)
+		deadwood_layer = f'deadwood_{LabelSourceEnum.visual_interpretation.value}'
+		assert deadwood_layer in layers, f'Deadwood layer {deadwood_layer} not found in: {layers}'
+
+		# Read the deadwood layer
+		gdf_visual = gpd.read_file(gpkg_path, layer=deadwood_layer)
+		assert len(gdf_visual) > 0, 'Visual layer has no data'
+
+		# Verify properties
+		assert 'source' in gdf_visual.columns
+		assert gdf_visual.iloc[0]['source'] in ['test_data', 'visual_interpretation']
+
+		# Verify unified AOI layer exists
+		assert 'aoi' in layers, f'AOI layer not found in: {layers}'
+
+		# Check the AOI layer
+		gdf_aoi = gpd.read_file(gpkg_path, layer='aoi')
+		assert len(gdf_aoi) > 0, 'AOI layer has no data'
+		assert gdf_aoi.iloc[0]['image_quality'] == 1
+		assert gdf_aoi.iloc[0]['notes'] == 'Test AOI from real data'
+		assert gdf_aoi.iloc[0]['source'] == 'manual'
+		assert pd.isna(gdf_aoi.iloc[0]['corrected_from_aoi_id'])
+
+
+def test_download_labels_without_aoi(auth_token, test_dataset_with_label_no_aoi):
+	"""Test downloading consolidated labels without AOI as single GeoPackage"""
+	dataset_id = test_dataset_with_label_no_aoi
+
+	# Make initial request to start the labels geopackage creation
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/labels.gpkg',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert 'status' in data
+	assert data['job_id'] == f'labels_{dataset_id}'
+
+	# Wait for processing to complete
+	max_attempts = 10
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/labels/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+		if status_data['status'] == 'completed':
+			break
+		time.sleep(1)
+	else:
+		pytest.fail('Labels GeoPackage processing did not complete within expected time')
+
+	# Get the labels file directly from downloads directory
+	labels_file = _labels_gpkg(dataset_id, auth_token)
+	assert labels_file.exists()
+
+	# Verify contents
+	with tempfile.TemporaryDirectory() as tmpdir:
+		gpkg_path = Path(tmpdir) / f'dataset_{dataset_id}_labels.gpkg'
+		shutil.copy2(labels_file, gpkg_path)
+
+		# List all available layers in the consolidated GeoPackage
+		available_layers = fiona.listlayers(gpkg_path)
+		print(f'Layers in consolidated geopackage: {available_layers}')
+
+		# Verify the deadwood layer exists (with source info in name)
+		deadwood_layer = f'deadwood_{LabelSourceEnum.visual_interpretation.value}'
+		assert deadwood_layer in available_layers
+
+		# Read the deadwood layer
+		gdf_labels = gpd.read_file(gpkg_path, layer=deadwood_layer)
+		assert len(gdf_labels) > 0  # Should have deadwood polygons
+		assert gdf_labels.iloc[0]['source'] == 'visual_interpretation'
+
+		# Verify no AOI layer exists (since this dataset has no AOI)
+		assert 'aoi' not in available_layers
+
+
+def test_labels_geopackage_excludes_soft_deleted_geometries(auth_token, test_dataset_for_download, test_user):
+	"""Ensure soft-deleted geometries are excluded from label downloads"""
+	dataset_id = test_dataset_for_download
+
+	# Create a label with two polygons
+	geometry = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[
+					[0.0, 0.0],
+					[1.0, 0.0],
+					[1.0, 1.0],
+					[0.0, 1.0],
+					[0.0, 0.0],
+				]
+			],
+			[
+				[
+					[2.0, 2.0],
+					[3.0, 2.0],
+					[3.0, 3.0],
+					[2.0, 3.0],
+					[2.0, 2.0],
+				]
+			],
+		],
+	}
+
+	payload = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.visual_interpretation,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=1,
+		geometry=geometry,
+		properties={'source': 'test_data'},
+	)
+
+	label = create_label_with_geometries(payload, test_user, auth_token)
+
+	gpkg_path = None
+	try:
+		with use_client(auth_token) as client:
+			geom_response = (
+				client.table(settings.deadwood_geometries_table)
+				.select('id')
+				.eq('label_id', label.id)
+				.execute()
+			)
+			geom_ids = [row['id'] for row in geom_response.data]
+			assert len(geom_ids) == 2
+
+			# Soft delete one geometry
+			client.table(settings.deadwood_geometries_table).update({'is_deleted': True}).eq('id', geom_ids[0]).execute()
+
+		# Create consolidated GeoPackage and verify only one feature is included
+		with use_client(auth_token) as db_client:
+			scope = read_export_scope(db_client, dataset_id)
+		gpkg_path = create_consolidated_geopackage(dataset_id, scope, Path(tempfile.mkdtemp()) / 'labels.gpkg')
+		deadwood_layer = f'deadwood_{LabelSourceEnum.visual_interpretation.value}'
+		assert deadwood_layer in fiona.listlayers(gpkg_path)
+
+		gdf_labels = gpd.read_file(gpkg_path, layer=deadwood_layer)
+		assert len(gdf_labels) == 1
+	finally:
+		# Cleanup label and geometries
+		with use_client(auth_token) as client:
+			client.table(settings.deadwood_geometries_table).delete().eq('label_id', label.id).execute()
+			client.table(settings.labels_table).delete().eq('id', label.id).execute()
+
+		# Cleanup geopackage temp dir
+		if gpkg_path:
+			gpkg_dir = Path(gpkg_path).parent
+			if gpkg_dir.exists():
+				shutil.rmtree(gpkg_dir)
+
+
+def test_download_consolidated_labels_multiple_types(auth_token, test_dataset_for_download, test_user):
+	"""Test downloading consolidated labels with multiple label types and sources in single GeoPackage"""
+	dataset_id = test_dataset_for_download
+
+	# Create test geometries
+	test_file = Path(__file__).parent.parent.parent.parent / 'assets' / 'test_data' / 'yanspain_crop_124_polygons.gpkg'
+	deadwood = gpd.read_file(test_file, layer='standing_deadwood').to_crs(epsg=4326)
+
+	# Convert deadwood geometries to MultiPolygon GeoJSON
+	deadwood_geojson = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[[float(x), float(y)] for x, y in poly.exterior.coords]
+				for geom in deadwood.geometry
+				for poly in (geom if isinstance(geom, MultiPolygon) else [geom])
+			]
+		],
+	}
+
+	# Create multiple labels with different sources and data types
+	# 1. Deadwood visual interpretation
+	deadwood_visual_payload = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.visual_interpretation,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=1,
+		geometry=deadwood_geojson,
+	)
+
+	# 2. Deadwood model prediction
+	deadwood_model_payload = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.model_prediction,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=2,
+		model_metadata=DEADWOOD_V1_MODEL_CONFIG,
+		geometry=deadwood_geojson,
+	)
+
+	# 3. Forest cover model prediction
+	forest_cover_model_payload = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.model_prediction,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.forest_cover,
+		label_quality=2,
+		model_metadata=TREECOVER_V1_MODEL_CONFIG,
+		geometry=deadwood_geojson,
+	)
+
+	# 4. Fixed model prediction (should be filtered out)
+	deadwood_fixed_payload = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.fixed_model_prediction,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=3,
+		geometry=deadwood_geojson,
+	)
+
+	# Create all labels
+	deadwood_visual_label = create_label_with_geometries(deadwood_visual_payload, test_user, auth_token)
+	deadwood_model_label = create_label_with_geometries(deadwood_model_payload, test_user, auth_token)
+	forest_cover_model_label = create_label_with_geometries(forest_cover_model_payload, test_user, auth_token)
+	deadwood_fixed_label = create_label_with_geometries(deadwood_fixed_payload, test_user, auth_token)
+
+	# Make initial request to start the labels geopackage creation
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/labels.gpkg',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert 'status' in data
+	assert data['job_id'] == f'labels_{dataset_id}'
+
+	# Wait for processing to complete
+	max_attempts = 10
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/labels/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+		if status_data['status'] == 'completed':
+			break
+		time.sleep(1)
+	else:
+		pytest.fail('Labels GeoPackage processing did not complete within expected time')
+
+	# Get the labels file directly from downloads directory
+	labels_file = _labels_gpkg(dataset_id, auth_token)
+	assert labels_file.exists()
+
+	# Verify contents
+	with tempfile.TemporaryDirectory() as tmpdir:
+		gpkg_path = Path(tmpdir) / f'dataset_{dataset_id}_labels.gpkg'
+		shutil.copy2(labels_file, gpkg_path)
+
+		# Get all layers in the consolidated geopackage
+		layers = fiona.listlayers(gpkg_path)
+		print(f'Layers in consolidated geopackage: {layers}')
+
+		# Expected layers (filtered to exclude fixed_model_prediction)
+		expected_layers = [
+			'deadwood_visual_interpretation',
+			'deadwood_model_prediction',
+			'forest_cover_model_prediction',
+		]
+
+		# Verify expected layers exist
+		for expected_layer in expected_layers:
+			assert expected_layer in layers, f'Expected layer {expected_layer} not found in: {layers}'
+
+		# Verify fixed_model_prediction layer is NOT included
+		assert 'deadwood_fixed_model_prediction' not in layers, 'Fixed model prediction layer should be filtered out'
+
+		# Verify each layer contains data and correct properties
+		# Check deadwood visual interpretation
+		gdf_deadwood_visual = gpd.read_file(gpkg_path, layer='deadwood_visual_interpretation')
+		assert len(gdf_deadwood_visual) > 0
+		assert gdf_deadwood_visual.iloc[0]['source'] == 'visual_interpretation'
+		assert gdf_deadwood_visual.iloc[0]['quality'] == 1
+
+		# Check deadwood model prediction
+		gdf_deadwood_model = gpd.read_file(gpkg_path, layer='deadwood_model_prediction')
+		assert len(gdf_deadwood_model) > 0
+		assert gdf_deadwood_model.iloc[0]['source'] == 'model_prediction'
+		assert gdf_deadwood_model.iloc[0]['quality'] == 2
+
+		# Check forest cover model prediction
+		gdf_forest_model = gpd.read_file(gpkg_path, layer='forest_cover_model_prediction')
+		assert len(gdf_forest_model) > 0
+		assert gdf_forest_model.iloc[0]['source'] == 'model_prediction'
+		assert gdf_forest_model.iloc[0]['quality'] == 2
+
+
+def test_download_labels_not_found(auth_token, test_dataset_for_download):
+	"""Test attempting to download labels for a dataset that has none"""
+	# Make initial request - should start background job
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/labels.gpkg',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Should return processing status initially
+	assert response.status_code == 200
+	data = response.json()
+	assert data['status'] == 'processing'
+
+	# Wait and check status - background job should fail
+	max_attempts = 10
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{test_dataset_for_download}/labels/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+
+		if status_data['status'] == 'failed':
+			assert 'No labels found' in status_data['message']
+			break
+
+		if status_data['status'] == 'processing':
+			time.sleep(1)
+			continue
+		pytest.fail(f'Unexpected status for labels job: {status_data["status"]}')
+
+	else:
+		pytest.fail('Labels GeoPackage processing did not fail within expected time')
+
+	# After waiting, no labels file and no work directory may remain
+	download_dir = settings.downloads_path / str(test_dataset_for_download)
+	assert not list(download_dir.glob('*.gpkg')), 'Labels file should not exist for dataset with no labels'
+	assert not list(download_dir.glob('.*.tmp')), 'Failed jobs must remove their work directory'
+
+
+def _fail_labels_export(monkeypatch):
+	"""Inject a failure after the job has started writing its temp file."""
+	from api.src.routers import download as download_router
+
+	def fail(dataset_id, scope, target):
+		Path(target).write_bytes(b'partial geopackage')
+		raise RuntimeError('synthetic labels generation error')
+
+	monkeypatch.setattr(download_router, 'create_consolidated_geopackage', fail)
+
+
+def test_labels_generation_failure_is_reported_and_cleaned_up(auth_token, test_dataset_for_download, monkeypatch):
+	"""A failing labels job writes an error marker that status and download report, and leaves no temp files."""
+	_fail_labels_export(monkeypatch)
+	dataset_id = test_dataset_for_download
+	download_dir = settings.downloads_path / str(dataset_id)
+	headers = {'Authorization': f'Bearer {auth_token}'}
+
+	try:
+		response = client.get(f'/api/v1/download/datasets/{dataset_id}/labels.gpkg', headers=headers)
+		assert response.status_code == 200
+
+		status = client.get(f'/api/v1/download/datasets/{dataset_id}/labels/status', headers=headers).json()
+		assert status['status'] == 'failed'
+		assert 'synthetic labels generation error' in status['message']
+
+		download = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/labels/download', headers=headers, follow_redirects=False
+		)
+		assert download.status_code == 500
+		assert 'synthetic labels generation error' in download.json()['detail']
+
+		leftovers = sorted(path.name for path in download_dir.iterdir())
+		assert len(leftovers) == 1 and leftovers[0].endswith('.gpkg.error'), leftovers
+	finally:
+		shutil.rmtree(download_dir, ignore_errors=True)
+
+
+def test_labels_retry_after_failure_clears_error_marker(auth_token, test_dataset_with_label, monkeypatch):
+	"""Requesting a failed download again restarts the job instead of serving the old error."""
+	dataset_id = test_dataset_with_label
+	headers = {'Authorization': f'Bearer {auth_token}'}
+	with monkeypatch.context() as patch:
+		_fail_labels_export(patch)
+		client.get(f'/api/v1/download/datasets/{dataset_id}/labels.gpkg', headers=headers)
+		status = client.get(f'/api/v1/download/datasets/{dataset_id}/labels/status', headers=headers).json()
+		assert status['status'] == 'failed'
+
+	response = client.get(f'/api/v1/download/datasets/{dataset_id}/labels.gpkg', headers=headers)
+	assert response.status_code == 200
+	labels_file = _labels_gpkg(dataset_id, auth_token)
+	assert labels_file.exists()
+	assert not labels_file.with_name(f'{labels_file.name}.error').exists()
+
+
+def test_download_dataset_async(auth_token, test_dataset_for_download):
+	"""Test asynchronous downloading of a dataset bundle"""
+	# Make initial request to start the download
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format and properties
+	assert response.status_code == 200
+	data = response.json()
+	assert 'status' in data
+	assert 'job_id' in data
+	assert data['job_id'] == str(test_dataset_for_download)
+
+	# Status should be either PROCESSING or COMPLETED
+	assert data['status'] in ['processing', 'completed']
+
+	# Wait a bit for processing to complete (if needed)
+	max_attempts = 5
+	for _ in range(max_attempts):
+		# Check status
+		status_response = client.get(
+			f'/api/v1/download/datasets/{test_dataset_for_download}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+
+		if status_data['status'] == 'completed':
+			# Verify download path is present
+			assert 'download_path' in status_data
+			assert _local_path(status_data['download_path']) == _local_path(
+				_dataset_download_path(test_dataset_for_download, auth_token)
+			)
+			break
+
+		# Wait before checking again
+		time.sleep(1)
+	else:
+		pytest.fail('Dataset processing did not complete within expected time')
+
+	# Verify the file exists in downloads directory
+	download_file = _dataset_zip(test_dataset_for_download, auth_token)
+	assert download_file.exists()
+
+	# Test the download redirect endpoint
+	download_response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/download',
+		headers={'Authorization': f'Bearer {auth_token}'},
+		follow_redirects=False,
+	)
+	assert download_response.status_code == 303
+	assert (
+		_local_path(download_response.headers['location'])
+		== _local_path(_dataset_download_path(test_dataset_for_download, auth_token))
+	)
+
+	# Verify ZIP contents
+	with zipfile.ZipFile(download_file) as zf:
+		files = zf.namelist()
+		# Verify expected files
+		assert any(f.startswith('ortho_') and f.endswith('.tif') for f in files)
+		assert 'METADATA.csv' in files
+		assert 'CITATION.cff' in files
+		assert 'LICENSE.txt' in files
+
+
+def test_single_dataset_bundle_metadata_includes_v2_metadata(auth_token, test_dataset_for_download):
+	"""Single-dataset bundles should include extracted v2_metadata fields in METADATA.csv."""
+	metadata_data = {
+		'dataset_id': test_dataset_for_download,
+		'version': 1,
+		'metadata': {
+			'gadm': {
+				'source': 'GADM',
+				'version': '4.1.0',
+				'admin_level_1': 'Germany',
+				'admin_level_2': 'Baden-Wuerttemberg',
+				'admin_level_3': 'Freiburg',
+			},
+			'biome': {
+				'source': 'WWF',
+				'version': '2.0',
+				'biome_id': 4,
+				'biome_name': 'Temperate Broadleaf and Mixed Forests',
+			},
+			'phenology': {
+				'source': 'MODIS',
+				'version': '1.0',
+				'phenology_curve': [0, 1, 2],
+			},
+		},
+	}
+
+	with use_service_client() as db_client:
+		db_client.table(settings.metadata_table).insert(metadata_data).execute()
+
+	try:
+		response = client.get(
+			f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert response.status_code == 200
+
+		_wait_for_download_completed(test_dataset_for_download, auth_token)
+
+		download_file = _dataset_zip(test_dataset_for_download, auth_token)
+		assert download_file.exists()
+
+		with zipfile.ZipFile(download_file) as zf, tempfile.TemporaryDirectory() as tmpdir:
+			zf.extract('METADATA.csv', tmpdir)
+			df = pd.read_csv(Path(tmpdir) / 'METADATA.csv')
+			assert len(df) == 1
+			assert df.loc[0, 'admin_level_0'] == 'Germany'
+			assert df.loc[0, 'admin_level_1'] == 'Baden-Wuerttemberg'
+			assert df.loc[0, 'admin_level_2'] == 'Freiburg'
+			assert df.loc[0, 'biome_name'] == 'Temperate Broadleaf and Mixed Forests'
+			assert bool(df.loc[0, 'has_phenology_curve']) is True
+			assert '"gadm"' in df.loc[0, 'metadata_json']
+	finally:
+		with use_client(auth_token) as db_client:
+			db_client.table(settings.metadata_table).delete().eq('dataset_id', test_dataset_for_download).execute()
+
+
+def test_single_dataset_bundle_status_reports_failed_when_generation_errors(
+	auth_token, test_dataset_for_download, data_directory
+):
+	"""Single-dataset status endpoint should surface bundle failures instead of polling forever."""
+	archive_path = data_directory / settings.archive_path / 'test-download.tif'
+	if archive_path.exists():
+		archive_path.unlink()
+
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 200
+
+	last_status = None
+	for _ in range(20):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{test_dataset_for_download}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		last_status = status_response.json()
+		if last_status['status'] == 'failed':
+			break
+		time.sleep(0.1)
+	else:
+		pytest.fail(f'Expected failed status, got: {last_status}')
+
+	assert 'No such file or directory' in last_status['message']
+
+	download_response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/download',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert download_response.status_code == 500
+	assert 'No such file or directory' in download_response.json()['detail']
+
+
+def test_download_dataset_already_exists(auth_token, test_dataset_for_download):
+	"""Test requesting a download when the file already exists"""
+	# First ensure the download exists
+	response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Wait until processing completes
+	# This endpoint is rate-limited (one request at a time per IP). In the test
+	# suite we can briefly hit 429s while the initial request is still finalizing
+	# its background task work. Treat those as "still processing" and keep polling.
+	max_attempts = 20
+	last_body = None
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{test_dataset_for_download}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.status_code != 200:
+			last_body = status_response.text
+			time.sleep(0.25)
+			continue
+
+		try:
+			status_json = status_response.json()
+		except Exception:
+			last_body = status_response.text
+			time.sleep(0.25)
+			continue
+
+		last_body = status_json
+		if isinstance(status_json, dict) and status_json.get('status') == 'completed':
+			break
+
+		time.sleep(0.25)
+	else:
+		pytest.fail(f'Dataset processing did not complete within expected time. Last status: {last_body}')
+
+	# Now request the download again
+	second_response = client.get(
+		f'/api/v1/download/datasets/{test_dataset_for_download}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Should immediately return COMPLETED status
+	assert second_response.status_code == 200
+	data = second_response.json()
+	assert data['status'] == 'completed'
+	assert 'download_path' in data
+	assert data['job_id'] == str(test_dataset_for_download)
+
+
+def test_download_dataset_with_multiple_labels(auth_token, test_dataset_for_download, test_user):
+	"""Test downloading a dataset with multiple label types"""
+	dataset_id = test_dataset_for_download
+
+	# Create two different types of labels for the same dataset
+	# First create a deadwood label
+	test_file = Path(__file__).parent.parent.parent.parent / 'assets' / 'test_data' / 'yanspain_crop_124_polygons.gpkg'
+	deadwood = gpd.read_file(test_file, layer='standing_deadwood').to_crs(epsg=4326)
+
+	# Convert deadwood geometries to MultiPolygon GeoJSON
+	deadwood_geojson = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[[float(x), float(y)] for x, y in poly.exterior.coords]
+				for geom in deadwood.geometry
+				for poly in (geom if isinstance(geom, MultiPolygon) else [geom])
+			]
+		],
+	}
+
+	# Create deadwood label payload
+	deadwood_payload = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.visual_interpretation,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=1,
+		geometry=deadwood_geojson,
+	)
+
+	# Create deadwood label payload
+	deadwood_payload_2 = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.model_prediction,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=2,
+		model_metadata=DEADWOOD_V1_MODEL_CONFIG,
+		geometry=deadwood_geojson,
+	)
+
+	# Create forest cover label payload (using the same geometry for testing simplicity)
+	forest_cover_payload = LabelPayloadData(
+		dataset_id=dataset_id,
+		label_source=LabelSourceEnum.model_prediction,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.forest_cover,
+		label_quality=2,
+		model_metadata=TREECOVER_V1_MODEL_CONFIG,
+		geometry=deadwood_geojson,
+	)
+
+	# Create both labels
+	deadwood_label = create_label_with_geometries(deadwood_payload, test_user, auth_token)
+	deadwood_label_2 = create_label_with_geometries(deadwood_payload_2, test_user, auth_token)
+	forest_cover_label = create_label_with_geometries(forest_cover_payload, test_user, auth_token)
+
+	# Make initial request to start the download
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	_wait_for_download_completed(dataset_id, auth_token)
+
+	# Get the download
+	download_response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/download',
+		headers={'Authorization': f'Bearer {auth_token}'},
+		follow_redirects=False,
+	)
+	assert download_response.status_code == 303
+
+	# Verify the file exists
+	download_file = _dataset_zip(dataset_id, auth_token)
+	assert download_file.exists()
+
+	# Verify ZIP contents includes both label types
+	with zipfile.ZipFile(download_file) as zf:
+		files = zf.namelist()
+
+		# Check for label files for both types
+		assert any(f'labels_{LabelDataEnum.deadwood.value}_{dataset_id}.gpkg' in f for f in files)
+		assert any(f'labels_{LabelDataEnum.forest_cover.value}_{dataset_id}.gpkg' in f for f in files)
+
+		# Verify each label file
+		deadwood_file = next(f for f in files if f'labels_{LabelDataEnum.deadwood.value}_{dataset_id}.gpkg' in f)
+		forest_cover_file = next(
+			f for f in files if f'labels_{LabelDataEnum.forest_cover.value}_{dataset_id}.gpkg' in f
+		)
+
+		with tempfile.TemporaryDirectory() as tmpdir:
+			# Extract and check deadwood labels
+			zf.extract(deadwood_file, tmpdir)
+			deadwood_path = Path(tmpdir) / deadwood_file
+
+			# List available layers in deadwood file
+			deadwood_layers = fiona.listlayers(deadwood_path)
+
+			# Get the visual interpretation layer
+			visual_layer = f'{LabelDataEnum.deadwood.value}_{LabelSourceEnum.visual_interpretation.value}'
+			assert visual_layer in deadwood_layers
+
+			# Get the model prediction layer
+			model_layer = f'{LabelDataEnum.deadwood.value}_{LabelSourceEnum.model_prediction.value}'
+			assert model_layer in deadwood_layers
+
+			# Verify deadwood visual interpretation layer
+			gdf_visual = gpd.read_file(deadwood_path, layer=visual_layer)
+			assert len(gdf_visual) > 0
+			assert gdf_visual.iloc[0]['source'] == 'visual_interpretation'
+			assert gdf_visual.iloc[0]['quality'] == 1
+
+			# Verify deadwood model prediction layer
+			gdf_model = gpd.read_file(deadwood_path, layer=model_layer)
+			assert len(gdf_model) > 0
+			assert gdf_model.iloc[0]['source'] == 'model_prediction'
+			assert gdf_model.iloc[0]['quality'] == 2
+
+			# Extract and check forest cover labels
+			zf.extract(forest_cover_file, tmpdir)
+			forest_cover_path = Path(tmpdir) / forest_cover_file
+
+			# List available layers in forest cover file
+			forest_layers = fiona.listlayers(forest_cover_path)
+
+			# Get the forest cover layer (model prediction)
+			forest_layer = f'{LabelDataEnum.forest_cover.value}_{LabelSourceEnum.model_prediction.value}'
+			assert forest_layer in forest_layers
+
+			# Verify forest cover layer
+			gdf_forest = gpd.read_file(forest_cover_path, layer=forest_layer)
+			assert len(gdf_forest) > 0
+			assert gdf_forest.iloc[0]['source'] == 'model_prediction'
+			assert gdf_forest.iloc[0]['quality'] == 2
+
+
+def test_download_datasets_with_different_licenses(auth_token, data_directory, test_file, test_user):
+	"""Test downloading datasets with different license types to ensure license info is correctly included"""
+	created_datasets = []
+	licenses_to_test = [
+		(LicenseEnum.cc_by, 'Attribution 4.0 International'),
+		(LicenseEnum.cc_by_sa, 'Attribution-ShareAlike 4.0 International'),
+		(LicenseEnum.cc_by_nc, 'Attribution-NonCommercial 4.0 International'),
+		(LicenseEnum.cc_by_nc_sa, 'Attribution-NonCommercial-ShareAlike 4.0 International'),
+	]
+
+	try:
+		with use_client(auth_token) as supabase_client:
+			# Create test datasets with different licenses
+			for license_enum, expected_license_text in licenses_to_test:
+				# Copy test file to archive directory
+				file_name = f'test-download-{license_enum.value}.tif'
+				archive_path = data_directory / settings.archive_path / file_name
+				shutil.copy2(test_file, archive_path)
+
+				# Create test dataset with specific license
+				dataset_data = {
+					'file_name': file_name,
+					'user_id': test_user,
+					'license': license_enum.value,
+					'platform': PlatformEnum.drone.value,
+					'authors': ['Test Author'],
+					'aquisition_year': 2024,
+					'aquisition_month': 1,
+					'aquisition_day': 1,
+					'data_access': DatasetAccessEnum.public.value,
+					'additional_information': f'Test dataset with {license_enum.value} license',
+				}
+				response = supabase_client.table(settings.datasets_table).insert(dataset_data).execute()
+				dataset_id = response.data[0]['id']
+				created_datasets.append(dataset_id)
+
+				# Create ortho entry
+				ortho_data = {
+					'dataset_id': dataset_id,
+					'ortho_file_name': file_name,
+					'version': 1,
+					'ortho_file_size': max(1, int((archive_path.stat().st_size / 1024 / 1024))),  # in MB
+					'ortho_upload_runtime': 0.1,
+				}
+				with use_service_client() as service_client:
+					service_client.table(settings.orthos_table).insert(ortho_data).execute()
+
+				# Create status entry
+				status_data = {
+					'dataset_id': dataset_id,
+					'current_status': StatusEnum.idle.value,
+					'is_upload_done': True,
+					'is_ortho_done': True,
+				}
+				supabase_client.table(settings.statuses_table).insert(status_data).execute()
+
+			# Test downloading each dataset and verify the license information
+			for i, (license_enum, expected_license_text) in enumerate(licenses_to_test):
+				dataset_id = created_datasets[i]
+
+				# Make initial request to start the download using the TestClient
+				response = client.get(
+					f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+					headers={'Authorization': f'Bearer {auth_token}'},
+				)
+
+				# Wait for processing to complete
+				max_attempts = 5
+				for _ in range(max_attempts):
+					status_response = client.get(
+						f'/api/v1/download/datasets/{dataset_id}/status',
+						headers={'Authorization': f'Bearer {auth_token}'},
+					)
+					if status_response.json()['status'] == 'completed':
+						break
+					time.sleep(1)
+				else:
+					pytest.fail('Dataset processing did not complete within expected time')
+
+				# Verify the file exists in downloads directory
+				download_file = _dataset_zip(dataset_id, auth_token)
+				assert download_file.exists()
+
+				# Extract and verify license information
+				with zipfile.ZipFile(download_file) as zf:
+					files = zf.namelist()
+					assert 'LICENSE.txt' in files
+
+					# Read and verify license content
+					license_content = zf.read('LICENSE.txt').decode('utf-8')
+					assert expected_license_text in license_content
+
+					# Verify CITATION.cff has license info
+					citation_content = zf.read('CITATION.cff').decode('utf-8')
+					assert f'license: {license_enum.value}' in citation_content
+
+					# Verify basic content inclusion
+					assert any(f.startswith('ortho_') and f.endswith('.tif') for f in files)
+					assert 'METADATA.csv' in files
+
+	finally:
+		# Cleanup the test datasets
+		with use_client(auth_token) as supabase_client:
+			for dataset_id in created_datasets:
+				supabase_client.table(settings.statuses_table).delete().eq('dataset_id', dataset_id).execute()
+				supabase_client.table(settings.orthos_table).delete().eq('dataset_id', dataset_id).execute()
+				supabase_client.table(settings.datasets_table).delete().eq('id', dataset_id).execute()
+
+				# Cleanup downloaded files
+				download_dir = settings.downloads_path / str(dataset_id)
+				if download_dir.exists():
+					shutil.rmtree(download_dir)
+
+				# Cleanup archive files
+				for license_enum, _ in licenses_to_test:
+					file_name = f'test-download-{license_enum.value}.tif'
+					archive_path = data_directory / settings.archive_path / file_name
+					if archive_path.exists():
+						archive_path.unlink()
+
+
+@pytest.fixture(scope='function')
+def test_dataset_with_invalid_geometries(auth_token, test_dataset_for_download, test_user):
+	"""Create a test dataset with invalid (self-intersecting) geometries"""
+	# Create a self-intersecting polygon (bowtie/figure-8 shape)
+	# This creates coordinates that form a self-intersecting polygon
+	invalid_geojson = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[
+					# Self-intersecting bowtie polygon
+					[0.0, 0.0],
+					[1.0, 1.0],
+					[1.0, 0.0],
+					[0.0, 1.0],
+					[0.0, 0.0],  # Back to start, creating self-intersection
+				]
+			],
+			[
+				[
+					# Another invalid polygon with duplicate consecutive points
+					[2.0, 2.0],
+					[2.0, 2.0],  # Duplicate point
+					[3.0, 2.0],
+					[3.0, 3.0],
+					[2.0, 3.0],
+					[2.0, 2.0],
+				]
+			],
+		],
+	}
+
+	# Create AOI with invalid geometry too
+	invalid_aoi_geojson = {
+		'type': 'MultiPolygon',
+		'coordinates': [
+			[
+				[
+					# Invalid AOI with self-intersection
+					[-1.0, -1.0],
+					[4.0, 4.0],
+					[4.0, -1.0],
+					[-1.0, 4.0],
+					[-1.0, -1.0],  # Self-intersecting
+				]
+			]
+		],
+	}
+
+	# Create label payload with invalid geometries
+	payload = LabelPayloadData(
+		dataset_id=test_dataset_for_download,
+		label_source=LabelSourceEnum.visual_interpretation,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=1,
+		geometry=invalid_geojson,
+		properties={'source': 'invalid_test'},
+		# AOI fields with invalid geometry
+		aoi_geometry=invalid_aoi_geojson,
+		aoi_image_quality=1,
+		aoi_notes='Test AOI with invalid geometry',
+	)
+
+	# Create label using the create_label_with_geometries function
+	label = create_label_with_geometries(payload, test_user, auth_token)
+
+	yield test_dataset_for_download
+
+	# Cleanup labels and geometries
+	with use_client(auth_token) as client:
+		# Get all labels for the dataset
+		response = (
+			client.table(settings.labels_table).select('id').eq('dataset_id', test_dataset_for_download).execute()
+		)
+
+		# Delete all associated geometries and labels
+		for label_record in response.data:
+			client.table(settings.deadwood_geometries_table).delete().eq('label_id', label_record['id']).execute()
+			if label.aoi_id:
+				client.table(settings.aois_table).delete().eq('id', label.aoi_id).execute()
+
+		client.table(settings.labels_table).delete().eq('dataset_id', test_dataset_for_download).execute()
+
+
+@pytest.fixture(scope='function')
+def test_dataset_with_large_complex_geometries(auth_token, test_dataset_for_download, test_user):
+	"""Create a test dataset with very large and complex geometries that might cause size/memory issues"""
+
+	# Create very large, complex MultiPolygon with many vertices
+	# This simulates the kind of complex geometries that might cause issues in real datasets
+
+	import math
+	import random
+
+	def create_large_complex_polygon(center_x, center_y, num_vertices=6000, radius=0.1):
+		"""Create a large polygon with many vertices that may self-intersect, similar to dataset 3896"""
+		coordinates = []
+		angle_step = 2 * math.pi / num_vertices
+
+		for i in range(num_vertices):
+			angle = i * angle_step
+			# Add significant randomness to create irregular shapes and guaranteed self-intersections
+			r = radius * (1 + random.uniform(-0.8, 0.8))
+			x = center_x + r * math.cos(angle)
+			y = center_y + r * math.sin(angle)
+
+			# Force self-intersections more frequently (every 50 points instead of 100)
+			if i % 50 == 0:
+				# Create more dramatic shifts that will cause intersections
+				x += random.uniform(-0.2, 0.2)
+				y += random.uniform(-0.2, 0.2)
+
+			# Add occasional "spikes" that go far out and back, causing ring self-intersections
+			if i % 200 == 0:
+				spike_distance = radius * random.uniform(2.0, 4.0)
+				spike_x = center_x + spike_distance * math.cos(angle)
+				spike_y = center_y + spike_distance * math.sin(angle)
+				coordinates.append([spike_x, spike_y])
+
+			coordinates.append([x, y])
+
+		# Close the polygon
+		coordinates.append(coordinates[0])
+		return coordinates
+
+	# Create fewer but much more complex polygons that mirror the real problematic geometries
+	complex_polygons = []
+
+	# Create geometries similar to the ones found in dataset 3896
+	problematic_vertex_counts = [6139, 4312, 4258, 3390, 3372]  # From actual dataset
+
+	for i, vertex_count in enumerate(problematic_vertex_counts):
+		center_x = i * 0.5
+		center_y = i * 0.3
+		poly_coords = create_large_complex_polygon(center_x, center_y, num_vertices=vertex_count)
+		complex_polygons.append([poly_coords])
+
+	# Add some explicitly self-intersecting large polygons
+	def create_large_self_intersecting_polygon(num_segments=500):
+		"""Create a large self-intersecting polygon"""
+		coords = []
+		for i in range(num_segments):
+			# Create a pattern that will self-intersect
+			angle = (i / num_segments) * 4 * math.pi  # Multiple loops
+			radius = 0.5 + 0.3 * math.sin(i / 10)  # Varying radius
+			x = radius * math.cos(angle)
+			y = radius * math.sin(angle)
+			coords.append([x, y])
+		coords.append(coords[0])  # Close the polygon
+		return coords
+
+	# Add several large self-intersecting polygons
+	for j in range(5):
+		large_intersecting_coords = create_large_self_intersecting_polygon(num_segments=800 + j * 200)
+		complex_polygons.append([large_intersecting_coords])
+
+	large_complex_geojson = {'type': 'MultiPolygon', 'coordinates': complex_polygons}
+
+	# Create large complex AOI as well
+	large_aoi_coords = create_large_complex_polygon(0, 0, num_vertices=3000, radius=2.0)
+	large_aoi_geojson = {'type': 'MultiPolygon', 'coordinates': [[large_aoi_coords]]}
+
+	# Create label payload with large complex geometries
+	payload = LabelPayloadData(
+		dataset_id=test_dataset_for_download,
+		label_source=LabelSourceEnum.visual_interpretation,
+		label_type=LabelTypeEnum.segmentation,
+		label_data=LabelDataEnum.deadwood,
+		label_quality=1,
+		geometry=large_complex_geojson,
+		properties={'source': 'large_complex_test'},
+		# AOI fields with large complex geometry
+		aoi_geometry=large_aoi_geojson,
+		aoi_image_quality=1,
+		aoi_notes='Test AOI with large complex geometry',
+	)
+
+	# Create label using the create_label_with_geometries function
+	label = create_label_with_geometries(payload, test_user, auth_token)
+
+	yield test_dataset_for_download
+
+	# Cleanup labels and geometries
+	with use_client(auth_token) as client:
+		# Get all labels for the dataset
+		response = (
+			client.table(settings.labels_table).select('id').eq('dataset_id', test_dataset_for_download).execute()
+		)
+
+		# Delete all associated geometries and labels
+		for label_record in response.data:
+			client.table(settings.deadwood_geometries_table).delete().eq('label_id', label_record['id']).execute()
+			if label.aoi_id:
+				client.table(settings.aois_table).delete().eq('id', label.aoi_id).execute()
+
+		client.table(settings.labels_table).delete().eq('dataset_id', test_dataset_for_download).execute()
+
+
+def test_download_dataset_with_large_complex_geometries(auth_token, test_dataset_with_large_complex_geometries):
+	"""Test downloading a dataset with very large and complex geometries"""
+	dataset_id = test_dataset_with_large_complex_geometries
+
+	print(f'Testing dataset {dataset_id} with large complex geometries...')
+
+	# Make initial request
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert data['job_id'] == str(dataset_id)
+
+	# Wait for processing - this might take longer with large geometries
+	max_attempts = 15  # Increased attempts for large/complex geometries
+	final_status = None
+
+	for attempt in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+		final_status = status_data['status']
+
+		print(f'Attempt {attempt + 1}: Status = {final_status}')
+
+		if final_status in ['completed', 'failed', 'error']:
+			break
+
+		# Wait longer between checks for complex processing
+		time.sleep(3)
+
+	# Log the final status for debugging
+	print(f'Final status after {max_attempts} attempts: {final_status}')
+
+	if final_status == 'completed':
+		print('Download completed - checking if large geometries were processed successfully')
+
+		# Verify the file exists
+		download_file = _dataset_zip(dataset_id, auth_token)
+		if download_file.exists():
+			file_size = download_file.stat().st_size
+			print(f'Download file size: {file_size / (1024 * 1024):.2f} MB')
+
+			# Check ZIP contents
+			with zipfile.ZipFile(download_file) as zf:
+				files = zf.namelist()
+				print(f'Files in ZIP: {files}')
+
+				# Extract and check the labels file if it exists
+				labels_files = [f for f in files if f.startswith('labels_') and f.endswith('.gpkg')]
+				if labels_files:
+					with tempfile.TemporaryDirectory() as tmpdir:
+						labels_file = labels_files[0]
+						zf.extract(labels_file, tmpdir)
+						gpkg_path = Path(tmpdir) / labels_file
+
+						try:
+							# Try to read the exported geometries
+							available_layers = fiona.listlayers(gpkg_path)
+							print(f'Available layers: {available_layers}')
+
+							if available_layers:
+								gdf = gpd.read_file(gpkg_path, layer=available_layers[0])
+								print(f'Successfully read {len(gdf)} geometries from exported file')
+
+								# Check geometry statistics
+								total_vertices = sum(
+									len(geom.exterior.coords) if hasattr(geom, 'exterior') else 0
+									for geom in gdf.geometry
+								)
+								print(f'Total vertices in exported geometries: {total_vertices}')
+
+								# Check if geometries are valid after processing
+								valid_geoms = gdf.geometry.is_valid.sum()
+								total_geoms = len(gdf)
+								print(f'Valid geometries: {valid_geoms}/{total_geoms}')
+
+								# Check file size of the exported GeoPackage
+								gpkg_size = gpkg_path.stat().st_size
+								print(f'Exported GeoPackage size: {gpkg_size / (1024 * 1024):.2f} MB')
+
+						except Exception as e:
+							print(f'Error reading exported geometries: {e}')
+							# This might be the error we're trying to reproduce
+							pytest.fail(f'Failed to process large geometries: {e}')
+		else:
+			print('Download file not found despite completed status')
+
+	elif final_status in ['failed', 'error']:
+		print('Download failed - this might be due to geometry size/complexity issues')
+		# Get more details about the failure if available
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		status_data = status_response.json()
+		if 'error' in status_data:
+			print(f'Error details: {status_data["error"]}')
+
+		# This reproduces a size/complexity-related error
+		pytest.fail(
+			f'Download failed with status: {final_status}. This might reproduce the size-related geometry error.'
+		)
+
+	else:
+		pytest.fail(f'Dataset processing did not complete within expected time. Final status: {final_status}')
+
+
+def test_download_dataset_with_invalid_geometries(auth_token, test_dataset_with_invalid_geometries):
+	"""Test downloading a dataset with invalid geometries to reproduce the error"""
+	dataset_id = test_dataset_with_invalid_geometries
+
+	# Make initial request
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert data['job_id'] == str(dataset_id)
+
+	# Wait for processing - this should either complete with error handling or fail
+	max_attempts = 10  # Increased attempts since processing might take longer with errors
+	final_status = None
+
+	for attempt in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+		final_status = status_data['status']
+
+		print(f'Attempt {attempt + 1}: Status = {final_status}')
+
+		if final_status in ['completed', 'failed', 'error']:
+			break
+
+		# Wait before checking again
+		time.sleep(2)
+
+	# Log the final status for debugging
+	print(f'Final status after {max_attempts} attempts: {final_status}')
+
+	# The test should either:
+	# 1. Complete successfully (if error handling works)
+	# 2. Fail with a specific error (reproducing the original issue)
+	# 3. Timeout (indicating the process is stuck)
+
+	if final_status == 'completed':
+		print('Download completed - checking if files were created with handled invalid geometries')
+
+		# Verify the file exists
+		download_file = _dataset_zip(dataset_id, auth_token)
+		if download_file.exists():
+			# Check ZIP contents to see how invalid geometries were handled
+			with zipfile.ZipFile(download_file) as zf:
+				files = zf.namelist()
+				print(f'Files in ZIP: {files}')
+
+				# Extract and check the labels file if it exists
+				labels_files = [f for f in files if f.startswith('labels_') and f.endswith('.gpkg')]
+				if labels_files:
+					with tempfile.TemporaryDirectory() as tmpdir:
+						labels_file = labels_files[0]
+						zf.extract(labels_file, tmpdir)
+						gpkg_path = Path(tmpdir) / labels_file
+
+						try:
+							# Try to read the exported geometries
+							available_layers = fiona.listlayers(gpkg_path)
+							print(f'Available layers: {available_layers}')
+
+							if available_layers:
+								gdf = gpd.read_file(gpkg_path, layer=available_layers[0])
+								print(f'Successfully read {len(gdf)} geometries from exported file')
+
+								# Check if geometries are now valid (fixed during export)
+								valid_geoms = gdf.geometry.is_valid.sum()
+								total_geoms = len(gdf)
+								print(f'Valid geometries: {valid_geoms}/{total_geoms}')
+
+						except Exception as e:
+							print(f'Error reading exported geometries: {e}')
+							# This might be the error we're trying to reproduce
+							raise
+		else:
+			print('Download file not found despite completed status')
+
+	elif final_status in ['failed', 'error']:
+		print('Download failed - this might be reproducing the original error')
+		# Get more details about the failure if available
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		status_data = status_response.json()
+		if 'error' in status_data:
+			print(f'Error details: {status_data["error"]}')
+
+		# This is actually what we expect - the test should fail due to invalid geometries
+		pytest.fail(f'Download failed with status: {final_status}. This reproduces the invalid geometry error.')
+
+	else:
+		pytest.fail(f'Dataset processing did not complete within expected time. Final status: {final_status}')
+
+
+def test_download_large_dataset_with_pagination(auth_token, test_dataset_with_large_complex_geometries):
+	"""Test downloading a dataset with many geometries to verify pagination works correctly"""
+	dataset_id = test_dataset_with_large_complex_geometries
+
+	print(f'Testing download with pagination for dataset {dataset_id}')
+
+	# Make initial request to start the download (using async pattern like other tests)
+	response = client.get(
+		f'/api/v1/download/datasets/{dataset_id}/dataset.zip',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	# Check response format
+	assert response.status_code == 200
+	data = response.json()
+	assert 'status' in data
+	assert 'job_id' in data
+	assert data['job_id'] == str(dataset_id)
+
+	# Wait for processing to complete
+	max_attempts = 15  # Increased for large datasets
+	final_status = None
+
+	for attempt in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/datasets/{dataset_id}/status',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+		final_status = status_data['status']
+
+		print(f'Attempt {attempt + 1}: Status = {final_status}')
+
+		if final_status == 'completed':
+			download_path = status_data['download_path']
+			print(f'✅ Large dataset download completed with pagination! Download path: {download_path}')
+			break
+
+		if final_status in ['failed', 'error']:
+			if 'error' in status_data:
+				print(f'Error details: {status_data["error"]}')
+			pytest.fail(f'Download failed with status: {final_status}')
+
+		# Wait before checking again
+		time.sleep(2)
+	else:
+		pytest.fail(f'Dataset processing did not complete within expected time. Final status: {final_status}')
+
+	# Verify the file exists in downloads directory
+	download_file = _dataset_zip(dataset_id, auth_token)
+	assert download_file.exists()
+
+	# Verify ZIP contents
+	with zipfile.ZipFile(download_file) as zf:
+		files = zf.namelist()
+		print(f'Files in download ZIP: {files}')
+
+		# Should contain expected files
+		assert any(f.startswith('ortho_') and f.endswith('.tif') for f in files)
+		assert any(f.startswith('labels_') and f.endswith('.gpkg') for f in files)
+		assert 'METADATA.csv' in files
+		assert 'LICENSE.txt' in files
+		assert 'CITATION.cff' in files
+
+		# Extract and verify the labels file contains many geometries
+		labels_file = next(f for f in files if f.startswith('labels_') and f.endswith('.gpkg'))
+		with tempfile.TemporaryDirectory() as tmpdir:
+			zf.extract(labels_file, tmpdir)
+			gpkg_path = Path(tmpdir) / labels_file
+
+			# Check the layers and geometry count
+			available_layers = fiona.listlayers(gpkg_path)
+			print(f'Available layers: {available_layers}')
+
+			if available_layers:
+				gdf = gpd.read_file(gpkg_path, layer=available_layers[0])
+				print(f'Successfully read {len(gdf)} geometries from exported file using pagination')
+
+				# This should be a large number if our complex geometry fixture worked
+				assert len(gdf) > 0
+
+
+# =============================================================================
+# Multi-Dataset Bundle Tests
+# =============================================================================
+
+
+class TestMultiBundleHelpers:
+	"""Unit tests for multi-dataset bundle helper functions"""
+
+	def test_get_unique_archive_name_no_collision(self):
+		"""Test that original name is preserved when no collision"""
+		used_names = set()
+		result = get_unique_archive_name('test.tif', used_names)
+		assert result == 'test.tif'
+
+	def test_get_unique_archive_name_with_collision(self):
+		"""Test that suffix is added on collision"""
+		used_names = {'test.tif'}
+		result = get_unique_archive_name('test.tif', used_names)
+		assert result == 'test_2.tif'
+
+	def test_get_unique_archive_name_multiple_collisions(self):
+		"""Test incremental suffixes for multiple collisions"""
+		used_names = {'test.tif', 'test_2.tif', 'test_3.tif'}
+		result = get_unique_archive_name('test.tif', used_names)
+		assert result == 'test_4.tif'
+
+	def test_get_ortho_base_filename_with_original(self):
+		"""Test filename extraction with original name enabled"""
+		dataset = Dataset(
+			id=123,
+			user_id='test-user',
+			file_name='SE_Rumperöd_20230614.zip',
+			license=LicenseEnum.cc_by,
+			platform=PlatformEnum.drone,
+			authors=['Test'],
+		)
+		result = get_ortho_base_filename(dataset, use_original=True)
+		assert result == 'SE_Rumperöd_20230614.tif'
+
+	def test_get_ortho_base_filename_without_original(self):
+		"""Test ID-based filename when original disabled"""
+		dataset = Dataset(
+			id=123,
+			user_id='test-user',
+			file_name='SE_Rumperöd_20230614.zip',
+			license=LicenseEnum.cc_by,
+			platform=PlatformEnum.drone,
+			authors=['Test'],
+		)
+		result = get_ortho_base_filename(dataset, use_original=False)
+		assert result == 'ortho_123.tif'
+
+	def test_get_ortho_base_filename_tif_extension(self):
+		"""Test that .tif files keep their name"""
+		dataset = Dataset(
+			id=456,
+			user_id='test-user',
+			file_name='my_ortho.tif',
+			license=LicenseEnum.cc_by,
+			platform=PlatformEnum.drone,
+			authors=['Test'],
+		)
+		result = get_ortho_base_filename(dataset, use_original=True)
+		assert result == 'my_ortho.tif'
+
+	def test_build_dataset_metadata_row_basic(self):
+		"""Test metadata row creation with basic data"""
+		dataset = Dataset(
+			id=123,
+			user_id='test-user',
+			file_name='test.tif',
+			license=LicenseEnum.cc_by,
+			platform=PlatformEnum.drone,
+			authors=['Author A', 'Author B'],
+			aquisition_year=2024,
+			aquisition_month=6,
+			aquisition_day=15,
+			additional_information='Test info',
+		)
+		ortho = {
+			'bbox': 'BOX(8.0 48.0, 9.0 49.0)',
+			'ortho_info': {'gsd_cm': 5.0},
+		}
+		metadata = {
+			'metadata': {
+				'gadm': {
+					'admin_level_1': 'Germany',
+					'admin_level_2': 'Baden-Württemberg',
+					'admin_level_3': 'Freiburg',
+				}
+			}
+		}
+
+		result = build_dataset_metadata_row(dataset, ortho, metadata)
+
+		assert result['deadtrees_id'] == 123
+		assert result['deadtrees_url'] == 'https://deadtrees.earth/datasets/123'
+		assert result['capture_date'] == '2024-06-15'
+		assert result['gsd_cm'] == 5.0
+		assert result['sensor_platform'] == 'drone'
+		assert result['authors'] == 'Author A, Author B'
+		assert result['admin_level_0'] == 'Germany'
+		assert result['admin_level_1'] == 'Baden-Württemberg'
+		assert result['admin_level_2'] == 'Freiburg'
+		assert result['centroid_lat'] == 48.5
+		assert result['centroid_lon'] == 8.5
+		assert result['additional_information'] == 'Test info'
+
+	def test_generate_bundle_job_id_deterministic(self):
+		"""Test that job ID is deterministic for same inputs"""
+		id1 = generate_bundle_job_id([1, 2, 3], True, True, True, 'v1')
+		id2 = generate_bundle_job_id([3, 1, 2], True, True, True, 'v1')  # Different order
+		assert id1 == id2  # Should be same (sorted)
+
+	def test_generate_bundle_job_id_different_params(self):
+		"""Test that different params produce different job IDs"""
+		base = generate_bundle_job_id([1, 2, 3], True, True, True, 'v1')
+		assert base != generate_bundle_job_id([1, 2, 3], False, True, True, 'v1')
+		assert base != generate_bundle_job_id([1, 2, 3], True, False, True, 'v1')
+		assert base != generate_bundle_job_id([1, 2, 3], True, True, False, 'v1')
+		assert base != generate_bundle_job_id([1, 2, 3], True, True, True, 'v2')
+
+
+@pytest.fixture(scope='function')
+def multi_test_datasets(auth_token, data_directory, test_file, test_user):
+	"""Create multiple test datasets for multi-bundle testing"""
+	created_datasets = []
+
+	try:
+		with use_client(auth_token) as supabase_client:
+			for i in range(3):
+				# Copy test file to archive directory with unique name
+				file_name = f'test-multi-{i}.tif'
+				archive_path = data_directory / settings.archive_path / file_name
+				shutil.copy2(test_file, archive_path)
+
+				# Create test dataset
+				dataset_data = {
+					'file_name': file_name,
+					'user_id': test_user,
+					'license': LicenseEnum.cc_by.value,
+					'platform': PlatformEnum.drone.value,
+					'authors': [f'Author {i}'],
+					'aquisition_year': 2024,
+					'aquisition_month': i + 1,
+					'aquisition_day': 15,
+					'data_access': DatasetAccessEnum.public.value,
+					'additional_information': f'Test dataset {i}',
+				}
+				response = supabase_client.table(settings.datasets_table).insert(dataset_data).execute()
+				dataset_id = response.data[0]['id']
+				created_datasets.append(dataset_id)
+
+				# Create ortho entry
+				ortho_data = {
+					'dataset_id': dataset_id,
+					'ortho_file_name': file_name,
+					'version': 1,
+					'ortho_file_size': max(1, int((archive_path.stat().st_size / 1024 / 1024))),
+					'ortho_upload_runtime': 0.1,
+					'bbox': 'BOX(8.0 48.0, 9.0 49.0)',
+				}
+				with use_service_client() as service_client:
+					service_client.table(settings.orthos_table).insert(ortho_data).execute()
+
+				# Create status entry
+				status_data = {
+					'dataset_id': dataset_id,
+					'current_status': StatusEnum.idle.value,
+					'is_upload_done': True,
+					'is_ortho_done': True,
+				}
+				supabase_client.table(settings.statuses_table).insert(status_data).execute()
+
+				# Create metadata entry with admin levels
+				metadata_data = {
+					'dataset_id': dataset_id,
+					'version': 1,
+					'metadata': {
+						'gadm': {
+							'admin_level_1': 'Germany',
+							'admin_level_2': 'Baden-Württemberg',
+							'admin_level_3': f'District_{i}',
+						}
+					},
+				}
+				with use_service_client() as service_client:
+					service_client.table(settings.metadata_table).insert(metadata_data).execute()
+
+		yield created_datasets
+
+	finally:
+		# Cleanup
+		with use_client(auth_token) as supabase_client:
+			for dataset_id in created_datasets:
+				supabase_client.table(settings.metadata_table).delete().eq('dataset_id', dataset_id).execute()
+				supabase_client.table(settings.statuses_table).delete().eq('dataset_id', dataset_id).execute()
+				supabase_client.table(settings.orthos_table).delete().eq('dataset_id', dataset_id).execute()
+				supabase_client.table(settings.datasets_table).delete().eq('id', dataset_id).execute()
+
+			# Cleanup archive files
+			for i in range(3):
+				file_name = f'test-multi-{i}.tif'
+				archive_path = data_directory / settings.archive_path / file_name
+				if archive_path.exists():
+					archive_path.unlink()
+
+		# Cleanup bundle files
+		bundles_dir = settings.downloads_path / 'bundles'
+		if bundles_dir.exists():
+			shutil.rmtree(bundles_dir)
+
+
+def test_multi_bundle_single_dataset(auth_token, multi_test_datasets):
+	"""Test multi-bundle endpoint with a single dataset"""
+	dataset_id = multi_test_datasets[0]
+
+	# Make request to bundle endpoint
+	response = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_id}',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 200
+	data = response.json()
+	assert 'status' in data
+	assert 'job_id' in data
+
+	# Wait for processing
+	job_id = data['job_id']
+	max_attempts = 10
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/bundle/status?job_id={job_id}',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		assert status_response.status_code == 200
+		status_data = status_response.json()
+
+		if status_data['status'] == 'completed':
+			break
+		time.sleep(1)
+	else:
+		pytest.fail('Bundle processing did not complete in time')
+
+	# Verify download path
+	assert 'download_path' in status_data
+	assert _local_path(status_data['download_path']) == settings.downloads_path / 'bundles' / f'{job_id}.zip'
+
+	# Verify file exists
+	bundle_file = settings.downloads_path / 'bundles' / f'{job_id}.zip'
+	assert bundle_file.exists()
+
+	# Verify contents
+	with zipfile.ZipFile(bundle_file) as zf:
+		files = zf.namelist()
+		assert 'METADATA.csv' in files
+		assert 'LICENSE.txt' in files
+		assert 'CITATION.cff' in files
+		assert any(f.endswith('.tif') for f in files)
+
+
+def test_multi_bundle_multiple_datasets(auth_token, multi_test_datasets):
+	"""Test multi-bundle endpoint with multiple datasets"""
+	dataset_ids = ','.join(str(d) for d in multi_test_datasets)
+
+	# Make request to bundle endpoint
+	response = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_ids}',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 200
+	data = response.json()
+	job_id = data['job_id']
+
+	# Wait for processing
+	max_attempts = 15
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/bundle/status?job_id={job_id}',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		status_data = status_response.json()
+
+		if status_data['status'] == 'completed':
+			break
+		time.sleep(1)
+	else:
+		pytest.fail('Bundle processing did not complete in time')
+
+	# Verify file exists
+	bundle_file = settings.downloads_path / 'bundles' / f'{job_id}.zip'
+	assert bundle_file.exists()
+
+	# Verify contents
+	with zipfile.ZipFile(bundle_file) as zf:
+		files = zf.namelist()
+
+		# Should have 3 ortho files
+		tif_files = [f for f in files if f.endswith('.tif')]
+		assert len(tif_files) == 3
+
+		# Check metadata CSV has all datasets
+		assert 'METADATA.csv' in files
+		with tempfile.TemporaryDirectory() as tmpdir:
+			zf.extract('METADATA.csv', tmpdir)
+			df = pd.read_csv(Path(tmpdir) / 'METADATA.csv')
+			assert len(df) == 3
+			assert 'deadtrees_id' in df.columns
+			assert 'deadtrees_url' in df.columns
+			assert 'admin_level_1' in df.columns
+
+
+def test_multi_bundle_with_original_filename(auth_token, multi_test_datasets):
+	"""Test that use_original_filename works correctly"""
+	dataset_ids = ','.join(str(d) for d in multi_test_datasets)
+
+	# Request with original filenames
+	response = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_ids}&use_original_filename=true',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 200
+	job_id = response.json()['job_id']
+
+	# Wait for completion
+	max_attempts = 15
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/bundle/status?job_id={job_id}',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.json()['status'] == 'completed':
+			break
+		time.sleep(1)
+
+	# Verify files use original names (test-multi-0.tif, etc.)
+	bundle_file = settings.downloads_path / 'bundles' / f'{job_id}.zip'
+	with zipfile.ZipFile(bundle_file) as zf:
+		files = zf.namelist()
+		tif_files = [f for f in files if f.endswith('.tif')]
+		# Should use original filenames (stems from test-multi-{i}.tif)
+		assert any('test-multi' in f for f in tif_files)
+
+
+def test_multi_bundle_without_original_filename(auth_token, multi_test_datasets):
+	"""Test that ID-based filenames work correctly"""
+	dataset_ids = ','.join(str(d) for d in multi_test_datasets)
+
+	# Request with ID-based filenames
+	response = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_ids}&use_original_filename=false',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+
+	assert response.status_code == 200
+	job_id = response.json()['job_id']
+
+	# Wait for completion
+	max_attempts = 15
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/bundle/status?job_id={job_id}',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.json()['status'] == 'completed':
+			break
+		time.sleep(1)
+
+	# Verify files use ID-based names (ortho_{id}.tif)
+	bundle_file = settings.downloads_path / 'bundles' / f'{job_id}.zip'
+	with zipfile.ZipFile(bundle_file) as zf:
+		files = zf.namelist()
+		tif_files = [f for f in files if f.endswith('.tif')]
+		# Should use ID-based filenames
+		assert all('ortho_' in f for f in tif_files)
+
+
+def test_multi_bundle_caching(auth_token, multi_test_datasets):
+	"""Test that repeated requests return cached bundle"""
+	dataset_ids = ','.join(str(d) for d in multi_test_datasets)
+
+	# First request
+	response1 = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_ids}',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	job_id1 = response1.json()['job_id']
+
+	# Wait for completion
+	max_attempts = 15
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/bundle/status?job_id={job_id1}',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.json()['status'] == 'completed':
+			break
+		time.sleep(1)
+
+	# Second request (should return immediately as completed)
+	response2 = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_ids}',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	job_id2 = response2.json()['job_id']
+	status2 = response2.json()['status']
+
+	# Same job ID and already completed
+	assert job_id1 == job_id2
+	assert status2 == 'completed'
+
+
+def test_multi_bundle_blocks_viewonly_dataset(auth_token, multi_test_datasets, test_user2):
+	"""Other users' bundles are blocked when any selected dataset is view-only."""
+	viewonly_dataset_id = multi_test_datasets[0]
+	dataset_ids = ','.join(str(d) for d in multi_test_datasets)
+
+	with use_client(auth_token) as db_client:
+		db_client.rpc(
+			'set_dataset_visibility',
+			{'p_dataset_id': viewonly_dataset_id, 'p_data_access': DatasetAccessEnum.viewonly.value},
+		).execute()
+
+	user2_token = login(settings.TEST_USER_EMAIL2, settings.TEST_USER_PASSWORD2, use_cached_session=False)
+	response = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_ids}',
+		headers={'Authorization': f'Bearer {user2_token}'},
+	)
+
+	assert response.status_code == 403
+	assert 'download access' in response.json()['detail']
+
+
+def test_multi_bundle_invalid_dataset_id(auth_token):
+	"""Test error handling for invalid dataset ID"""
+	response = client.get(
+		'/api/v1/download/bundle.zip?dataset_ids=99999999',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 404
+
+
+def test_multi_bundle_invalid_format(auth_token):
+	"""Test error handling for invalid dataset_ids format"""
+	response = client.get(
+		'/api/v1/download/bundle.zip?dataset_ids=abc,def',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 400
+
+
+def test_multi_bundle_empty_ids(auth_token):
+	"""Test error handling for empty dataset_ids"""
+	response = client.get(
+		'/api/v1/download/bundle.zip?dataset_ids=',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 400
+
+
+def test_multi_bundle_download_redirect(auth_token, multi_test_datasets):
+	"""Test the download redirect endpoint"""
+	dataset_ids = ','.join(str(d) for d in multi_test_datasets[:1])
+
+	# Create bundle
+	response = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={dataset_ids}',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	job_id = response.json()['job_id']
+
+	# Wait for completion
+	max_attempts = 10
+	for _ in range(max_attempts):
+		status_response = client.get(
+			f'/api/v1/download/bundle/status?job_id={job_id}',
+			headers={'Authorization': f'Bearer {auth_token}'},
+		)
+		if status_response.json()['status'] == 'completed':
+			break
+		time.sleep(1)
+
+	# Test download redirect
+	download_response = client.get(
+		f'/api/v1/download/bundle/download?job_id={job_id}',
+		headers={'Authorization': f'Bearer {auth_token}'},
+		follow_redirects=False,
+	)
+	assert download_response.status_code == 303
+	assert _local_path(download_response.headers['location']) == settings.downloads_path / 'bundles' / f'{job_id}.zip'
+
+
+def test_cached_restricted_bundle_is_authorized_before_it_is_recorded(private_test_dataset_for_download, test_user2):
+	"""A bundle another user already prepared must pass per-dataset access checks first."""
+	dataset_id = private_test_dataset_for_download
+	with use_client() as db_client:
+		dataset = Dataset(**db_client.table(settings.datasets_table).select('*').eq('id', dataset_id).execute().data[0])
+		ortho = db_client.table(settings.orthos_table).select('*').eq('dataset_id', dataset_id).execute().data[0]
+	version = content_version([(dataset, ortho, None, None)], token='')
+	job_id = generate_bundle_job_id([dataset_id], False, False, True, version)
+	bundle_file = settings.downloads_path / 'bundles' / f'{job_id}.zip'
+	bundle_file.parent.mkdir(parents=True, exist_ok=True)
+	bundle_file.write_bytes(b'cached bundle')
+	try:
+		user2_token = login(settings.TEST_USER_EMAIL2, settings.TEST_USER_PASSWORD2, use_cached_session=False)
+		response = client.get(
+			f'/api/v1/download/bundle.zip?dataset_ids={private_test_dataset_for_download}',
+			headers={'Authorization': f'Bearer {user2_token}'},
+		)
+		assert response.status_code == 404
+		assert _download_requests(private_test_dataset_for_download) == []
+	finally:
+		bundle_file.unlink(missing_ok=True)
+
+
+def test_bundle_is_one_request_with_one_row_per_distinct_dataset(auth_token, multi_test_datasets, test_user):
+	first, second = multi_test_datasets[:2]
+	response = client.get(
+		f'/api/v1/download/bundle.zip?dataset_ids={first},{second},{first}',
+		headers={'Authorization': f'Bearer {auth_token}'},
+	)
+	assert response.status_code == 200
+	rows = _download_requests(first) + _download_requests(second)
+	assert len(rows) == 2 and {row['kind'] for row in rows} == {'bundle'}
+	assert len({row['request_id'] for row in rows}) == 1

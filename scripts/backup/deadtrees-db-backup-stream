@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+readonly stage="${DEADTREES_DB_BACKUP_STAGE:-/home/dendro/.deadtrees-db-backup-stage}"
+readonly zstd_bin="${DEADTREES_DB_BACKUP_ZSTD_BIN:-zstd}"
+readonly command_path="${DEADTREES_DB_BACKUP_STREAM_COMMAND_PATH:-/home/dendro/.local/bin/deadtrees-db-backup-stream}"
+
+if [[ "${SSH_ORIGINAL_COMMAND:-}" != "$command_path" ]]; then
+	printf 'Command denied.\n' >&2
+	exit 64
+fi
+
+test -f "$stage/postgres.dump.zst"
+exec "$zstd_bin" -q -dc -- "$stage/postgres.dump.zst"

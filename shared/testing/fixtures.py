@@ -1,0 +1,177 @@
+import pytest
+from pathlib import Path
+from supabase import create_client
+from shared.settings import settings
+from shared.db import login, use_client, use_service_client
+import shutil
+from .safety import test_environment_only
+
+
+# These fixtures force DB setup even if a test is marked unit. Unmarked tests
+# keep the historical default and get DB setup; only pure unit-test sessions skip
+# Supabase setup.
+DATABASE_FIXTURES = frozenset(
+	{
+		'auth_token',
+		'test_user',
+		'test_user2',
+		'datasets_with_mixed_access',
+	}
+)
+
+
+def _session_needs_database(request) -> bool:
+	return any(
+		item.get_closest_marker('integration') is not None
+		or item.get_closest_marker('slow') is not None
+		or item.get_closest_marker('comprehensive') is not None
+		or DATABASE_FIXTURES.intersection(item.fixturenames)
+		or item.get_closest_marker('unit') is None
+		for item in request.session.items
+	)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def test_processor_user(request):
+	"""Create the processor user in the database if it doesn't exist and clean up after tests"""
+	if not _session_needs_database(request):
+		yield None
+		return
+
+	supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+	user_id = None
+
+	try:
+		# Try to sign up the processor user
+		response = supabase.auth.sign_up(
+			{
+				'email': settings.PROCESSOR_USERNAME,
+				'password': settings.PROCESSOR_PASSWORD,
+			}
+		)
+		user_id = response.user.id if response.user else None
+	except Exception:
+		# If user already exists, try to get the user ID
+		try:
+			response = supabase.auth.sign_in_with_password(
+				{
+					'email': settings.PROCESSOR_USERNAME,
+					'password': settings.PROCESSOR_PASSWORD,
+				}
+			)
+			user_id = response.user.id if response.user else None
+		except Exception as sign_in_error:
+			print(f'Note: Processor user setup - {str(sign_in_error)}')
+
+	# Yield to run tests
+	yield user_id
+
+	# # Cleanup: Delete the processor user if we have their ID
+	# if user_id:
+	# 	try:
+	# 		# Need admin token to delete user
+	# 		supabase.auth.admin.delete_user(user_id)
+	# 		print(f'Successfully deleted processor user with ID: {user_id}')
+	# 	except Exception as e:
+	# 		print(f'Failed to delete processor user: {str(e)}')
+
+
+@pytest.fixture(scope='session')
+def auth_token(test_processor_user):
+	"""Provide authentication token for tests"""
+	return login(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD)
+
+
+@pytest.fixture
+def test_file():
+	"""Fixture to provide test GeoTIFF file path"""
+	import os
+
+	# Check for environment variable to override test file
+	env_test_file = os.getenv('TEST_FILE_PATH')
+	if env_test_file:
+		file_path = Path(env_test_file)
+		if file_path.is_absolute():
+			# Use absolute path as-is
+			pass
+		else:
+			# Treat as relative to project root
+			file_path = Path(__file__).parent.parent.parent / env_test_file
+	else:
+		# Default test file
+		file_path = Path(__file__).parent.parent.parent / 'assets' / 'test_data' / 'test-data.tif'
+
+	# Alternative files for manual testing (uncomment as needed):
+	# file_path = Path(__file__).parent.parent.parent / 'assets' / 'test_data' / 'debugging' / '5392' / 'ortho_5392.tif'
+	# file_path = Path(__file__).parent.parent.parent / 'assets' / 'test_data' / 'test-data-small.tif'
+	# file_path = Path(__file__).parent.parent.parent / 'assets' / 'test_data' / 'debugging' / '5991_ortho.tif'
+
+	if not file_path.exists():
+		pytest.skip(f'Test file not found: {file_path}')
+	return file_path
+
+
+# @test_environment_only
+@pytest.fixture(scope='session', autouse=True)
+def cleanup_database(request):
+	"""Clean up database tables after all tests"""
+	if not _session_needs_database(request):
+		yield
+		return
+
+	yield
+
+	with use_service_client() as client:
+		client.table('jt_data_publication_datasets').delete().neq('dataset_id', 0).execute()
+		client.table('jt_data_publication_user_info').delete().neq('publication_id', 0).execute()
+		client.table('data_publication').delete().neq('id', 0).execute()
+		client.table('user_info').delete().neq('id', 0).execute()
+		client.table(settings.datasets_table).delete().neq('id', 0).execute()
+		client.table(settings.logs_table).delete().neq('id', 1).execute()
+
+
+@pytest.fixture(scope='session')
+def data_directory():
+	"""Create and manage the data directory structure for tests"""
+	# Ensure test environment before proceeding
+	from .safety import ensure_test_environment
+
+	ensure_test_environment()
+
+	# Create the data directory structure
+	data_dir = Path(settings.BASE_DIR)
+	archive_dir = data_dir / settings.ARCHIVE_DIR
+	cogs_dir = data_dir / settings.COG_DIR
+	thumbnails_dir = data_dir / settings.THUMBNAIL_DIR
+	label_objects_dir = data_dir / settings.LABEL_OBJECTS_DIR
+	trash_dir = data_dir / settings.TRASH_DIR
+	downloads_dir = data_dir / settings.DOWNLOADS_DIR
+	raw_images_dir = data_dir / settings.RAW_IMAGES_DIR
+
+	# Create all directories
+	for directory in [
+		archive_dir,
+		cogs_dir,
+		thumbnails_dir,
+		label_objects_dir,
+		trash_dir,
+		downloads_dir,
+		raw_images_dir,
+	]:
+		directory.mkdir(parents=True, exist_ok=True)
+
+	yield data_dir
+
+	# Cleanup after all tests
+	for directory in [
+		archive_dir,
+		cogs_dir,
+		thumbnails_dir,
+		label_objects_dir,
+		trash_dir,
+		downloads_dir,
+		raw_images_dir,
+	]:
+		if directory.exists():
+			shutil.rmtree(directory)
+			directory.mkdir(parents=True, exist_ok=True)

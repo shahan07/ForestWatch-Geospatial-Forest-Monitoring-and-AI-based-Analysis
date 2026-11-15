@@ -1,0 +1,32 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+pydantic_geojson
+pydantic_partial
+python-dotenv
+python-multipart
+supabase
+gotrue
+numpy>=2.4.6,<2.5
+rasterio==1.5.2
+rio-cogeo
+fire
+overpy
+geopandas
+paramiko
+requests
+aiofiles
+boto3
+httpx
+tqdm
+pyarrow
+fiona
+pillow
+pyproj
+shapely
+pyogrio
+# Open-vocabulary tile search: keep the text encoder on the processor-compatible
+# PyTorch pair; the API Dockerfile installs CPU wheels for amd64.
+torch==2.6.0
+torchvision==0.21.0
+open-clip-torch>=2.24.0

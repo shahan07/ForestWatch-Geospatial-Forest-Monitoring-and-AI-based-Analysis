@@ -1,0 +1,986 @@
+import shutil
+import signal
+import sys
+import docker
+import socket
+from pathlib import Path
+from processor.src.process_geotiff import process_geotiff
+from processor.src.process_odm import process_odm
+from shared.models import QueueTask, TaskTypeEnum, StatusEnum
+from shared.settings import settings
+from shared.db import use_client, login, login_verified
+from shared.status import update_status
+from shared.processing_tasks import downstream_tasks_missing_geotiff, format_missing_geotiff_error
+from .processing_notifications import (
+	ProcessingNotificationType,
+	notify_processing_result_safely as _notify_processing_result_safely,
+	reconcile_processing_notifications_safely as _reconcile_processing_notifications_safely,
+)
+from .process_thumbnail import process_thumbnail
+from .process_cog import process_cog
+from .process_deadwood_segmentation import process_deadwood_segmentation
+from .process_treecover_segmentation import process_treecover_segmentation
+from .process_deadwood_treecover_combined_v2 import process_deadwood_treecover_combined_v2
+from .process_aoi_segmentation import process_aoi_segmentation
+from .process_embeddings import process_embeddings
+from .process_doy_estimation import process_doy_estimation
+from .process_georef_check import process_georef_check
+from .process_metadata import process_metadata
+from .exceptions import AuthenticationError, ProcessingError
+from .utils.linear_issues import report_processing_failure
+from .utils.memory_release import release_process_memory
+from .utils.startup_cleanup import clear_scratch
+from .utils.drain_control import (
+	BackgroundProcessResult,
+	acknowledge_drain_request,
+	clear_loop_unhealthy,
+	clear_pending_docker_cleanup,
+	is_drain_requested,
+	load_pending_docker_cleanup,
+	mark_pending_docker_cleanup,
+)
+from .utils.queue_runtime import (
+	claim_task,
+	delete_queue_task,
+	get_active_task,
+	get_next_task,
+	owns_queue_task,
+	release_queue_task,
+)
+from shared.logging import LogContext, LogCategory, UnifiedLogger, SupabaseHandler, set_process_log_fields
+
+# Initialize logger with proper cleanup
+logger = UnifiedLogger(__name__)
+
+
+def _kill_dangling_dataset_resources(dataset_id: int):
+	"""Kill any running containers and remove volumes left over from an interrupted job."""
+	try:
+		client = docker.from_env(timeout=settings.DOCKER_CLIENT_TIMEOUT_SECONDS)
+		label_filter = f'dt_dataset_id={dataset_id}'
+
+		containers = client.containers.list(all=True, filters={'label': label_filter})
+		for c in containers:
+			try:
+				if c.status == 'running':
+					c.stop(timeout=10)
+				c.remove(force=True)
+				logger.info(f'Removed dangling container {c.short_id} for dataset {dataset_id}')
+			except Exception as e:
+				logger.warning(f'Failed to remove dangling container {c.short_id} for dataset {dataset_id}: {e}')
+
+		volumes = client.volumes.list(filters={'label': label_filter})
+		for v in volumes:
+			try:
+				v.remove()
+				logger.info(f'Removed dangling volume {v.name} for dataset {dataset_id}')
+			except Exception as e:
+				logger.warning(f'Failed to remove dangling volume {v.name} for dataset {dataset_id}: {e}')
+	except Exception as e:
+		logger.warning(f'Error during dangling resource cleanup for dataset {dataset_id}: {e}')
+logger.add_supabase_handler(SupabaseHandler())
+
+# Tracks the task currently being processed so the graceful-shutdown handler can
+# cleanly return it to the queue when the container is asked to stop (deploy /
+# restart). Holds the QueueTask while a stage is running; None when idle.
+_inflight_task: QueueTask | None = None
+
+
+def _set_inflight_task(task: QueueTask | None) -> None:
+	global _inflight_task
+	_inflight_task = task
+
+
+# Failures this process caught but could not finish recording (for example the
+# database was briefly unreachable). Keyed by queue task id. The stale-row
+# recovery finishes the bookkeeping with the real error instead of reporting a
+# container crash, because the process that saw the error is still running.
+_unrecorded_failures: dict[int, tuple[str, str]] = {}
+
+# Set once an orderly shutdown has started. The handler's SystemExit can be
+# replaced by an error raised while a stage unwinds (for example paramiko
+# reporting "Garbage packet received" when an interrupted SFTP transfer is
+# closed). That error is a consequence of the shutdown, not a dataset failure.
+_shutdown_requested = False
+
+
+def _handle_graceful_shutdown(signum, frame):
+	"""Cleanly re-queue the in-flight task on an orderly shutdown (SIGTERM/SIGINT).
+
+	This is what distinguishes a *transient* interruption from a *fault*. A deploy
+	or manual restart sends SIGTERM, so this handler runs and returns the in-flight
+	task to the waiting queue (is_processing=False, status idle) — it is retried
+	transparently and leaves no stale active row behind. An OOM kill or hard crash
+	delivers SIGKILL (or kills the process outright), so this handler never runs;
+	the task is left as a stale is_processing=True row, which the crash-recovery
+	path then treats as a genuine, non-retryable failure. Retrying OOM/bug crashes
+	just loops and burns hours of compute, so we deliberately do not.
+	"""
+	global _shutdown_requested
+	_shutdown_requested = True
+	task = _inflight_task
+	if task is not None:
+		try:
+			mark_pending_docker_cleanup(task.dataset_id)
+		except OSError as e:
+			logger.warning(f'Could not record pending Docker cleanup for dataset {task.dataset_id}: {e}')
+		try:
+			# The token captured at task start may have expired during a long
+			# stage; log in fresh for the bookkeeping writes.
+			token = login(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD)
+			logger.warning(
+				f'Received signal {signum}; gracefully re-queuing in-flight task {task.id} '
+				f'for dataset {task.dataset_id} for retry',
+				LogContext(
+					category=LogCategory.PROCESS,
+					dataset_id=task.dataset_id,
+					user_id=task.user_id,
+					token=token,
+				),
+			)
+			with use_client(token) as client:
+				client.table(settings.statuses_table).update({
+					'current_status': StatusEnum.idle.value,
+					'has_error': False,
+					'error_message': None,
+					'error_stage': None,
+				}).eq('dataset_id', task.dataset_id).execute()
+			release_queue_task(token, task)
+		except Exception as e:
+			# Best-effort: if we cannot clean up, fall through and exit anyway. The
+			# task is then left as a stale active row and treated as a crash next run.
+			logger.error(f'Failed to gracefully re-queue task {task.id} during shutdown: {e}')
+		# ODM runs as a detached container via the host Docker socket and outlives
+		# this process, so stop it too. This comes after the queue release because
+		# Docker can be slow enough to outlast the stop grace period, and a kill
+		# before the release turns the retry into a crash (DT-1543). If a kill cuts
+		# the cleanup short, the restarted worker finishes it from the marker.
+		_kill_dangling_dataset_resources(task.dataset_id)
+		clear_pending_docker_cleanup()
+	sys.exit(0)
+
+
+def _finish_pending_docker_cleanup() -> None:
+	"""Remove Docker resources that an interrupted shutdown left on this host."""
+	dataset_id = load_pending_docker_cleanup()
+	if dataset_id is None:
+		return
+	_kill_dangling_dataset_resources(dataset_id)
+	clear_pending_docker_cleanup()
+
+
+# Task lifecycle events in v2_logs.extra.event, read per worker_id by the
+# Factory processors panel (factory_processors).
+TASK_STARTED_EVENT = 'task_started'
+TASK_COMPLETED_EVENT = 'task_completed'
+TASK_FAILED_EVENT = 'task_failed'
+
+
+def _log_task_event(task: QueueTask, event: str, message: str, **extra) -> None:
+	logger.info(
+		message,
+		LogContext(category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, extra={'event': event, **extra}),
+	)
+
+# Maps each task type to its corresponding is_*_done flag and human-readable stage name.
+# Used by crash detection to determine exactly which stage a previous run crashed during.
+PIPELINE_STAGE_MAP = [
+	(TaskTypeEnum.odm_processing, 'is_odm_done', 'odm_processing'),
+	(TaskTypeEnum.geotiff, 'is_ortho_done', 'ortho_processing'),
+	(TaskTypeEnum.metadata, 'is_metadata_done', 'metadata_processing'),
+	(TaskTypeEnum.cog, 'is_cog_done', 'cog_processing'),
+	(TaskTypeEnum.thumbnail, 'is_thumbnail_done', 'thumbnail_processing'),
+	(TaskTypeEnum.deadwood_v1, 'is_deadwood_done', 'deadwood_segmentation'),
+	(TaskTypeEnum.treecover_v1, 'is_forest_cover_done', 'forest_cover_segmentation'),
+	(
+		TaskTypeEnum.deadwood_treecover_combined_v2,
+		'is_combined_model_done',
+		'deadwood_treecover_combined_segmentation',
+	),
+	(TaskTypeEnum.aoi_v1, 'is_aoi_done', 'aoi_segmentation'),
+	(TaskTypeEnum.embeddings_v1, 'is_embeddings_done', 'embedding_processing'),
+	(TaskTypeEnum.doy_estimation_v1, 'is_doy_estimation_done', 'doy_estimation'),
+	(TaskTypeEnum.georef_check_v1, 'is_georef_check_done', 'georef_check'),
+]
+
+
+def _stage_done_flags(done_flags: str | tuple[str, ...]) -> tuple[str, ...]:
+	return (done_flags,) if isinstance(done_flags, str) else done_flags
+
+
+def refresh_processor_token(task: QueueTask, fallback_token: str | None = None) -> str:
+	"""Best-effort token refresh for stage-boundary logging and updates."""
+	try:
+		return login(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD)
+	except Exception:
+		if fallback_token is not None:
+			return fallback_token
+		raise AuthenticationError('Invalid processor token', task_id=task.id)
+
+
+def get_worker_id() -> str:
+	"""Return a stable processor identity for queue ownership."""
+	if settings.PROCESSOR_WORKER_ID:
+		return settings.PROCESSOR_WORKER_ID
+	if settings.DEV_MODE:
+		return f'local-dev-{socket.gethostname()}'
+	for machine_id_path in (Path('/host/etc/machine-id'), Path('/etc/machine-id')):
+		try:
+			machine_id = machine_id_path.read_text().strip()
+		except OSError:
+			continue
+		if machine_id:
+			return f'host-{machine_id[:12]}'
+	raise RuntimeError('PROCESSOR_WORKER_ID must be set to a unique stable value for this processor host')
+
+
+def detect_crashed_stage(status_data: dict, task_types: list) -> str:
+	"""Determine which pipeline stage a previous crash occurred during.
+
+	Walks the pipeline in order and returns the first stage that was requested
+	but not yet marked as done in v2_statuses.
+
+	Args:
+		status_data: Row from v2_statuses table
+		task_types: List of TaskTypeEnum values from the queue task
+
+	Returns:
+		str: Human-readable stage name where the crash occurred
+	"""
+	for task_type, done_flags, stage_name in PIPELINE_STAGE_MAP:
+		if task_type in task_types and not all(status_data.get(flag, False) for flag in _stage_done_flags(done_flags)):
+			return stage_name
+	return 'unknown'
+
+
+def get_completed_stages(status_data: dict) -> list[str]:
+	"""Get list of pipeline stages that completed successfully before the crash.
+
+	Args:
+		status_data: Row from v2_statuses table
+
+	Returns:
+		list[str]: Human-readable names of completed stages
+	"""
+	completed = []
+	for task_type, done_flags, stage_name in PIPELINE_STAGE_MAP:
+		if all(status_data.get(flag, False) for flag in _stage_done_flags(done_flags)):
+			completed.append(stage_name)
+	return completed
+
+
+def are_requested_stages_complete(status_data: dict, task_types: list) -> bool:
+	"""Return True when all requested pipeline stages are already marked complete."""
+	requested = [
+		flag
+		for task_type, done_flags, _ in PIPELINE_STAGE_MAP
+		if task_type in task_types
+		for flag in _stage_done_flags(done_flags)
+	]
+	return bool(requested) and all(status_data.get(done_flag, False) for done_flag in requested)
+
+
+def is_dataset_uploaded_or_processed(task: QueueTask, token: str) -> tuple:
+	"""Check if a dataset is ready for processing by verifying its upload status and error status.
+
+	Args:
+	    task (QueueTask): The task to check
+	    token (str): Authentication token
+
+	Returns:
+	    tuple: (is_ready: bool, has_error: bool)
+	        - is_ready: True if dataset is uploaded and ready for processing
+	        - has_error: True if dataset has errors (should be removed from queue)
+	"""
+	with use_client(token) as client:
+		response = (
+			client.table(settings.statuses_table)
+			.select('is_upload_done,has_error')
+			.eq('dataset_id', task.dataset_id)
+			.execute()
+		)
+
+		if not response.data:
+			logger.warning(
+				f'No status found for dataset {task.dataset_id}', extra={'token': token, 'dataset_id': task.dataset_id}
+			)
+			return False, False
+
+		is_uploaded = response.data[0]['is_upload_done']
+		has_error = response.data[0].get('has_error', False)  # Default to False if field doesn't exist
+
+		if has_error:
+			logger.warning(
+				f'Dataset {task.dataset_id} has errors, will remove from queue',
+				extra={'token': token, 'dataset_id': task.dataset_id},
+			)
+			return False, True
+
+		msg = f'dataset upload status: {is_uploaded}'
+		logger.info(msg, extra={'token': token})
+
+		return is_uploaded, False
+
+
+def _fail_crashed_task(token: str, task: QueueTask, status: dict | None) -> None:
+	"""Fail a task whose previous attempt left a stale active row, then dequeue it.
+
+	If this process saw the attempt fail but could not record it, the remembered
+	error is recorded. Otherwise the previous run died mid-stage without a graceful
+	shutdown (SIGKILL / OOM / hard crash). Those failures are deterministic, so
+	retrying just loops and wastes hours of compute; the task is failed for human
+	attention rather than re-queued.
+	"""
+	recorded = _unrecorded_failures.get(task.id)
+	if recorded is not None:
+		stage, error_msg = recorded
+	elif status is not None:
+		stage = detect_crashed_stage(status, task.task_types)
+		error_msg = f'Processing container crashed during {stage}. Completed: {get_completed_stages(status)}'
+	else:
+		stage = 'unknown'
+		error_msg = 'Processing container crashed before a status row was written'
+
+	logger.warning(
+		f'{"Recording earlier failure" if recorded else "Crash detected"} for dataset {task.dataset_id}: {error_msg}',
+		LogContext(category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+	)
+	_finalize_failure(token, task, stage if stage != 'unknown' else None, error_msg)
+
+
+def _remember_failure(task: QueueTask, error: Exception) -> tuple[str, str]:
+	stage = error.task_type if isinstance(error, ProcessingError) else 'processing'
+	_unrecorded_failures[task.id] = (stage, str(error))
+	return _unrecorded_failures[task.id]
+
+
+def _record_failure(task: QueueTask, error: Exception) -> None:
+	"""Record the failure of a task this worker still owns.
+
+	The orchestrator is the only writer of failure state. It signs in fresh because
+	the stage token can expire during a long stage. Until every step has
+	succeeded, the error is kept in ``_unrecorded_failures`` so the next poll
+	reports this error rather than a container crash. That memory is lost if the
+	process exits first, and the row is then reported as a crash.
+	"""
+	stage, message = _remember_failure(task, error)
+	_finalize_failure(login(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD), task, stage, message)
+
+
+def _finalize_failure(token: str, task: QueueTask, stage: str | None, message: str) -> None:
+	"""Mark the dataset failed and idle, report it, and dequeue the task; the one failure path."""
+	update_status(
+		token,
+		dataset_id=task.dataset_id,
+		current_status=StatusEnum.idle,
+		has_error=True,
+		error_message=message,
+		error_stage=stage,
+	)
+	# Logged once the error is recorded: a retry after a failed update must not count it twice.
+	_log_task_event(task, TASK_FAILED_EVENT, f'Failed queued task {task.id} during {stage or "an unknown stage"}', stage=stage)
+
+	try:
+		report_processing_failure(
+			token=token,
+			dataset_id=task.dataset_id,
+			stage=stage or 'unknown',
+			error_message=message,
+		)
+	except Exception as linear_error:
+		logger.warning(f'Failed to create Linear issue: {linear_error}')
+
+	_notify_processing_result_safely(task, ProcessingNotificationType.failed, token)
+
+	# Remove from queue — the dataset must be explicitly re-triggered once fixed.
+	delete_queue_task(token, task)
+	_unrecorded_failures.pop(task.id, None)
+	logger.info(
+		f'Removed failed task {task.id} from queue',
+		LogContext(category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+	)
+
+
+def process_task(task: QueueTask, token: str):
+	# Log start of processing
+	logger.info(
+		f'Starting processing for task {task.id}',
+		LogContext(
+			category=LogCategory.PROCESS,
+			dataset_id=task.dataset_id,
+			user_id=task.user_id,
+			token=token,
+			extra={'task_types': [t.value for t in task.task_types]},
+		),
+	)
+
+	# Register as in-flight after the queue row has been claimed so a SIGTERM can
+	# release this worker's task without touching another worker's active row.
+	_set_inflight_task(task)
+	# remove processing path if it exists
+	if Path(settings.processing_path).exists():
+		shutil.rmtree(settings.processing_path, ignore_errors=True)
+	# Tools write their temp files to the scratch dir; a failed task can leave tens of GB
+	# there (13362: a 27 GB GDAL warp file), and on a tmpfs /data that is RAM (DT-1381).
+	clear_scratch(settings.scratch_path)
+	rss_before, rss_after = release_process_memory()
+	if rss_before is not None:
+		logger.info(
+			f'Processor memory before task: {rss_before:.1f} GB resident, {rss_after:.1f} GB after release',
+			LogContext(category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+		)
+
+	try:
+		downstream_without_geotiff = downstream_tasks_missing_geotiff(task.task_types)
+		if downstream_without_geotiff:
+			error_message = format_missing_geotiff_error(downstream_without_geotiff)
+			raise ProcessingError(
+				error_message,
+				task_type='geotiff_dependency',
+				task_id=task.id,
+				dataset_id=task.dataset_id,
+			)
+
+		# Process ODM first if it's in the list (generates orthomosaic for ZIP uploads)
+		if TaskTypeEnum.odm_processing in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'Starting ODM processing',
+					LogContext(category=LogCategory.ODM, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+				)
+				process_odm(task, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'ODM processing failed: {str(e)}',
+					LogContext(
+						category=LogCategory.ODM,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+						extra={'error': str(e)},
+					),
+				)
+				raise ProcessingError(str(e), task_type='odm_processing', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Process convert_geotiff if it's in the list (handles ortho creation for both upload types)
+		if TaskTypeEnum.geotiff in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'Starting GeoTIFF conversion',
+					LogContext(
+						category=LogCategory.ORTHO, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				process_geotiff(task, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'GeoTIFF conversion failed: {str(e)}',
+					LogContext(
+						category=LogCategory.ORTHO,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+						extra={'error': str(e)},
+					),
+				)
+				raise ProcessingError(str(e), task_type='geotiff', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Process metadata if requested
+		if TaskTypeEnum.metadata in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing metadata',
+					LogContext(
+						category=LogCategory.METADATA, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				process_metadata(task, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Metadata processing failed: {str(e)}',
+					LogContext(
+						category=LogCategory.METADATA, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				raise ProcessingError(str(e), task_type='metadata', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Process cog if requested
+		if TaskTypeEnum.cog in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					f'processing cog to {settings.processing_path}',
+					LogContext(category=LogCategory.COG, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+				)
+				process_cog(task, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'COG processing failed: {str(e)}',
+					LogContext(
+						category=LogCategory.COG, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				raise ProcessingError(str(e), task_type='cog', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Process thumbnail if requested
+		if TaskTypeEnum.thumbnail in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					f'processing thumbnail to {settings.processing_path}',
+					LogContext(
+						category=LogCategory.THUMBNAIL, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				process_thumbnail(task, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Thumbnail processing failed: {str(e)}',
+					LogContext(
+						category=LogCategory.THUMBNAIL,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+					),
+				)
+				raise ProcessingError(str(e), task_type='thumbnail', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Process deadwood_segmentation if requested
+		if TaskTypeEnum.deadwood_v1 in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing deadwood segmentation',
+					LogContext(
+						category=LogCategory.DEADWOOD, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				process_deadwood_segmentation(task, token, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Deadwood segmentation failed: {str(e)}',
+					LogContext(
+						category=LogCategory.DEADWOOD,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+					),
+				)
+				raise ProcessingError(
+					str(e), task_type='deadwood_segmentation', task_id=task.id, dataset_id=task.dataset_id
+				)
+
+		# Process treecover_segmentation if requested (runs after deadwood)
+		if TaskTypeEnum.treecover_v1 in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing tree cover segmentation',
+					LogContext(
+						category=LogCategory.TREECOVER, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				process_treecover_segmentation(task, token, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Tree cover segmentation failed: {str(e)}',
+					LogContext(
+						category=LogCategory.TREECOVER,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+					),
+				)
+				raise ProcessingError(
+					str(e), task_type='treecover_segmentation', task_id=task.id, dataset_id=task.dataset_id
+				)
+
+		# Process combined deadwood+treecover segmentation if requested
+		if TaskTypeEnum.deadwood_treecover_combined_v2 in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing combined deadwood+treecover segmentation',
+					LogContext(
+						category=LogCategory.DEADWOOD, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				process_deadwood_treecover_combined_v2(task, token, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Combined segmentation failed: {str(e)}',
+					LogContext(
+						category=LogCategory.DEADWOOD,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+					),
+				)
+				raise ProcessingError(
+					str(e),
+					task_type='deadwood_treecover_combined_segmentation',
+					task_id=task.id,
+					dataset_id=task.dataset_id,
+				)
+
+		# Generate the automatic AOI polygon if requested (runs before audit)
+		if TaskTypeEnum.aoi_v1 in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing AOI segmentation',
+					LogContext(category=LogCategory.AOI, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+				)
+				process_aoi_segmentation(task, token, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'AOI segmentation failed: {str(e)}',
+					LogContext(
+						category=LogCategory.AOI,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+					),
+				)
+				raise ProcessingError(str(e), task_type='aoi_segmentation', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Compute per-tile CLIP embeddings for open-vocabulary search.
+		# Runs last so the standardized ortho and all prior stages are already done.
+		if TaskTypeEnum.embeddings_v1 in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing tile embeddings',
+					LogContext(
+						category=LogCategory.EMBEDDINGS, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				process_embeddings(task, token, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Tile embedding failed: {str(e)}',
+					LogContext(
+						category=LogCategory.EMBEDDINGS,
+						dataset_id=task.dataset_id,
+						user_id=task.user_id,
+						token=token,
+					),
+				)
+				raise ProcessingError(str(e), task_type='embedding_processing', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Estimate the acquisition date. Reads the stored COG (not the transient
+		# standardized ortho), so it can be rerun on its own for every dataset.
+		if TaskTypeEnum.doy_estimation_v1 in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing acquisition-date estimation',
+					LogContext(category=LogCategory.DOY, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+				)
+				process_doy_estimation(task, token, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Acquisition-date estimation failed: {str(e)}',
+					LogContext(category=LogCategory.DOY, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+				)
+				raise ProcessingError(str(e), task_type='doy_estimation', task_id=task.id, dataset_id=task.dataset_id)
+
+		# Measure the georeferencing offset against satellite imagery. Reads the
+		# stored COG and the AOI, so it can be rerun on its own for every dataset.
+		if TaskTypeEnum.georef_check_v1 in task.task_types:
+			try:
+				token = refresh_processor_token(task, token)
+				logger.info(
+					'processing georeferencing check',
+					LogContext(category=LogCategory.GEOREF, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+				)
+				process_georef_check(task, token, settings.processing_path)
+			except Exception as e:
+				token = refresh_processor_token(task, token)
+				logger.error(
+					f'Georeferencing check failed: {str(e)}',
+					LogContext(category=LogCategory.GEOREF, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+				)
+				raise ProcessingError(str(e), task_type='georef_check', task_id=task.id, dataset_id=task.dataset_id)
+
+	except Exception as e:
+		if _shutdown_requested:
+			# The shutdown handler already re-queued this task; finish exiting.
+			raise SystemExit(0) from e
+		# A reclaimed task belongs to another attempt; do not overwrite its status
+		# or delete its queue row while handling this stale attempt's failure.
+		if task.claimed_at:
+			try:
+				still_owned = owns_queue_task(token, task)
+			except Exception as claim_error:
+				# Preserve the stage error if ownership remains unknown after retries.
+				_remember_failure(task, e)
+				raise e from claim_error
+			if not still_owned:
+				_set_inflight_task(None)
+				raise
+		# This path owns the failure bookkeeping; clear the in-flight marker now so a
+		# SIGTERM mid-handling cannot re-queue the failed task or clear its error.
+		_set_inflight_task(None)
+
+		logger.exception(
+			f'Processing failed: {str(e)}',
+			LogContext(category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token),
+		)
+		try:
+			_record_failure(task, e)
+		except Exception as bookkeeping_error:
+			logger.exception(
+				f'Could not record failure of task {task.id} yet; the next poll retries: {bookkeeping_error}',
+				LogContext(category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id),
+			)
+		raise
+
+	else:
+		token = login(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD)
+		# All processing stages are complete. Keep the queue row claimed so a stop
+		# during notification I/O is recovered as completed work, not reprocessed.
+		_set_inflight_task(None)
+		_notify_processing_result_safely(task, ProcessingNotificationType.completed, token)
+		delete_queue_task(token, task)
+		_log_task_event(task, TASK_COMPLETED_EVENT, f'Finished processing queued task {task.id}')
+
+	finally:
+		_set_inflight_task(None)
+
+		if not settings.DEV_MODE:
+			shutil.rmtree(settings.processing_path, ignore_errors=True)
+
+
+def background_process() -> BackgroundProcessResult:
+	"""
+	Process the next healthy task from the queue, if there is one.
+
+	Returns WORKED when this worker claimed and completed a task, FAILED when it
+	claimed a task but the processing path raised after bookkeeping, and IDLE
+	when the queue has no ready work or the host requested a drain.
+
+	On each call this function:
+	1. Logs in as the processor service account.
+	2. Installs a graceful-shutdown handler so a deploy/restart (SIGTERM) cleanly
+	   re-queues the in-flight task for retry instead of leaving it stranded.
+	3. Handles this worker's stale `is_processing=true` queue row left behind by
+	   a previous run. Because graceful stops self-clean via the shutdown handler,
+	   a leftover active row means either a failure this process could not record
+	   yet (it is recorded now with its real error) or a hard kill (SIGKILL/OOM)
+	   or hard crash:
+	   - If the status is idle and all requested stages are done, the row is just removed.
+	   - Otherwise it is a genuine, non-retryable crash: the dataset is marked
+	     errored, a Linear issue is filed, and the task is removed from the queue.
+	     OOM/bug crashes are deterministic, so retrying only loops and wastes
+	     compute — we deliberately do not retry them.
+	4. Detects crashes the same way for the next waiting task, then processes the
+	   first healthy, ready task and returns.
+
+	Multiple workers can read the same waiting row, but only one can atomically
+	claim it by flipping `is_processing=false` to true and recording `claimed_by`.
+	"""
+	# Install graceful-shutdown handlers so deploys/restarts re-queue cleanly.
+	signal.signal(signal.SIGTERM, _handle_graceful_shutdown)
+	signal.signal(signal.SIGINT, _handle_graceful_shutdown)
+
+	token, user = login_verified(settings.PROCESSOR_USERNAME, settings.PROCESSOR_PASSWORD)
+	if not user:
+		raise AuthenticationError('Invalid token after fresh login')
+
+	worker_id = get_worker_id()
+	set_process_log_fields(worker_id=worker_id)
+	_finish_pending_docker_cleanup()
+	active_recovery_attempted = False
+
+	while True:
+		active_task = None if active_recovery_attempted else get_active_task(token, worker_id)
+		# A successful active-queue poll proves the restarted worker can reach the
+		# queue. Clear any persisted crash-loop marker before recovery or processing
+		# can become long-running, so host maintenance does not stop healthy work.
+		clear_loop_unhealthy()
+		active_recovery_attempted = True
+		if active_task is not None:
+			logger.warning(
+				f'Found stale active queue task {active_task.id} for dataset {active_task.dataset_id}; '
+				'previous run died without graceful shutdown',
+				LogContext(
+					category=LogCategory.PROCESS,
+					dataset_id=active_task.dataset_id,
+					user_id=active_task.user_id,
+					token=token,
+				),
+			)
+
+			with use_client(token) as client:
+				status_resp = client.table(settings.statuses_table) \
+					.select('*').eq('dataset_id', active_task.dataset_id).execute()
+
+			_kill_dangling_dataset_resources(active_task.dataset_id)
+
+			status = status_resp.data[0] if status_resp.data else None
+
+			if status is not None and status.get('has_error'):
+				try:
+					_notify_processing_result_safely(active_task, ProcessingNotificationType.failed, token)
+				except Exception as notification_error:
+					logger.warning(f'Keeping failed task {active_task.id} until notification persistence recovers: {notification_error}')
+					continue
+				delete_queue_task(token, active_task)
+				_unrecorded_failures.pop(active_task.id, None)
+				continue
+
+			if active_task.id in _unrecorded_failures:
+				# This process saw the task fail but could not record it; finish that
+				# bookkeeping with the real error rather than reporting a crash.
+				try:
+					_fail_crashed_task(token, active_task, status)
+				except Exception as finalization_error:
+					logger.warning(f'Keeping failed task {active_task.id} until finalization recovers: {finalization_error}')
+				continue
+
+			if (
+				status is not None
+				and status.get('current_status') == StatusEnum.idle.value
+				and are_requested_stages_complete(status, active_task.task_types)
+			):
+				# Crashed only after finishing all requested stages — no fault to
+				# report, just remove the stale queue row.
+				logger.info(
+					f'Removing stale completed queue task {active_task.id} for dataset {active_task.dataset_id}',
+					LogContext(
+						category=LogCategory.PROCESS,
+						dataset_id=active_task.dataset_id,
+						user_id=active_task.user_id,
+						token=token,
+					),
+				)
+				update_status(
+					token,
+					dataset_id=active_task.dataset_id,
+					current_status=StatusEnum.idle,
+					has_error=False,
+				)
+				try:
+					_notify_processing_result_safely(active_task, ProcessingNotificationType.completed, token)
+				except Exception as notification_error:
+					logger.warning(f'Keeping completed task {active_task.id} until notification persistence recovers: {notification_error}')
+					continue
+				delete_queue_task(token, active_task)
+				continue
+
+			# Genuine mid-stage crash — fail it instead of retrying.
+			try:
+				_fail_crashed_task(token, active_task, status)
+			except Exception as finalization_error:
+				logger.warning(f'Keeping failed task {active_task.id} until finalization recovers: {finalization_error}')
+			continue
+
+		if is_drain_requested():
+			# Exercise the release's queue-read contract before advertising readiness.
+			# This is read-only: no task is claimed while a drain is active.
+			get_next_task(token)
+			acknowledge_drain_request(worker_id)
+			return BackgroundProcessResult.IDLE
+
+		task = get_next_task(token)
+		if task is None:
+			print('No tasks in the queue.')
+			_reconcile_processing_notifications_safely()
+			return BackgroundProcessResult.IDLE
+
+		if is_drain_requested():
+			acknowledge_drain_request(worker_id)
+			return BackgroundProcessResult.IDLE
+
+		is_ready, has_error = is_dataset_uploaded_or_processed(task, token)
+
+		if has_error:
+			claimed_task = claim_task(token, task, worker_id)
+			if claimed_task is None:
+				logger.info(
+					f'Skipping errored queue task {task.id}; another worker claimed it first',
+					LogContext(
+						category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+					),
+				)
+				continue
+
+			# Dataset already has errors - remove task from queue
+			logger.info(
+				f'Removing errored task {task.id} for dataset {task.dataset_id} from queue',
+				LogContext(
+					category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+				),
+			)
+			delete_queue_task(token, claimed_task)
+			continue
+
+		if not is_ready:
+			# Not uploaded yet - skip, try again on a later poll
+			logger.info(
+				f'Skipping task {task.id} - dataset not uploaded yet; will retry later',
+				LogContext(
+					category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+				),
+			)
+			_reconcile_processing_notifications_safely()
+			return BackgroundProcessResult.IDLE
+
+		claimed_task = claim_task(token, task, worker_id)
+		if claimed_task is None:
+			logger.info(
+				f'Skipping queue task {task.id}; another worker claimed it first',
+				LogContext(
+					category=LogCategory.PROCESS, dataset_id=task.dataset_id, user_id=task.user_id, token=token
+				),
+			)
+			continue
+		task = claimed_task
+
+		if is_drain_requested():
+			acknowledge_drain_request(worker_id)
+			release_queue_task(token, task)
+			return BackgroundProcessResult.IDLE
+
+		# CRASH DETECTION: check if a previous run crashed mid-processing
+		with use_client(token) as client:
+			status_resp = client.table(settings.statuses_table) \
+				.select('*').eq('dataset_id', task.dataset_id).execute()
+
+		if status_resp.data:
+			status = status_resp.data[0]
+			if status['current_status'] != 'idle':
+				# Previous crash detected - current_status is still set to a
+				# processing stage. Fail it (no retry) for the same reason as the
+				# stale-active-task path above.
+				_fail_crashed_task(token, task, status)
+				continue  # check next task in queue
+
+		# Normal processing - found a healthy, ready task
+		_log_task_event(task, TASK_STARTED_EVENT, f'Start processing queued task: {task}.')
+		try:
+			process_task(task, token=token)
+		except Exception:
+			_reconcile_processing_notifications_safely()
+			return BackgroundProcessResult.FAILED
+		_reconcile_processing_notifications_safely()
+		return BackgroundProcessResult.WORKED
+
+
+if __name__ == '__main__':
+	background_process()

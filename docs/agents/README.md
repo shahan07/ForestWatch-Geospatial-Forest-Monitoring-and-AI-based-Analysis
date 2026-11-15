@@ -1,0 +1,69 @@
+# Agent Guide
+
+This directory is the tracked source of truth for agent-facing rules. Claude Code,
+Codex and other coding agents use these files directly; editor-specific rule
+folders are intentionally retired.
+
+## How To Navigate
+
+1. Read the root `AGENTS.md` first.
+2. Read `docs/agents/rules.md` for project rules, architecture, testing, and gotchas.
+3. Read `docs/agents/testing-strategy.md` before planning tests, TDD, CI, or browser validation.
+4. Read `docs/agents/project-structure.md` before adding files or moving code.
+5. Read `docs/agents/environment-and-access.md` before touching env files, MCP config,
+   remote hosts, or credentials.
+6. For frontend work, also read `frontend/AGENTS.md`.
+7. For recurring operational checks, use `docs/playbooks/platform-status-check.md`.
+8. For dataset failures, stuck processing, or upload-triggered failures, use
+   `docs/playbooks/dataset-debugging.md`.
+9. For diagrams, use `docs/playbooks/technical-diagrams.md`.
+10. For local pre-PR code quality reviews, use
+    `docs/agents/local-review-instructions.md`.
+11. For `/reflect-and-learn` or end-of-session retrospectives, use
+    `docs/playbooks/reflect-and-learn.md`. Use `docs/playbooks/reflect-context.md`
+    when the focus is only rules/docs context cleanup.
+12. For release, deploy, or release-announcement questions, use
+    `docs/playbooks/create-release.md`, `docs/playbooks/processor-deploy.md`, and
+    local-only `docs/ops/*` files when present. For which hosts run a production
+    worker and how each one auto-deploys, use `docs/playbooks/processor-hosts.md`.
+13. For manual QA runs, use `.agents/skills/run-deadtrees-qa/SKILL.md`.
+14. For security-audit findings, Dependabot alerts or accepting a risk, use
+    `docs/playbooks/security-audit.md`.
+15. For the unattended monitor and its data coverage, use
+    `docs/playbooks/operator-chat.md` and `docs/playbooks/operator-data-coverage.md`.
+16. For backups and restores, use `docs/playbooks/database-backups.md`.
+17. For upload retries, prepackaged dataset releases and the storage nginx rollout,
+    use `docs/playbooks/upload-retry-contract.md`,
+    `docs/playbooks/prepackaged-dataset-release-deploy.md` and
+    `docs/playbooks/storage-nginx-http2-rollout.md`.
+
+    Repository skills live in `.agents/skills/`; `.claude/skills/` links to the
+    same folders so Claude Code discovers them. Add new skills under
+    `.agents/skills/` and link them from `.claude/skills/`.
+
+## Tracked Versus Local
+
+Tracked files should explain behavior, workflow, file names, and secret boundaries.
+They must not contain real passwords, API tokens, private keys, bearer tokens, or
+machine-specific private host credentials.
+
+Local-only files may contain real access details and are ignored:
+
+- `.env`
+- `.codex/config.toml`
+- `.codex/local-access.md`
+- `.claude/settings.local.json`
+- `docs/ops/*`
+- `frontend/.env.*.local`
+- `.local/`
+
+When a task needs local or production access, inspect those local files without
+printing secret values back to the user.
+
+## Migration Notes
+
+The old editor-specific rules mixed durable project knowledge with tool-specific
+syntax, stale MCP names, and local access assumptions. Durable guidance now lives
+here and in root/frontend `AGENTS.md`. If you find references to retired rule
+paths, old MCP names, or old repository names, treat them as stale unless current
+code proves otherwise.

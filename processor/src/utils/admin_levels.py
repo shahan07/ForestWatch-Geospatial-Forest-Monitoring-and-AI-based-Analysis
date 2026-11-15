@@ -1,0 +1,118 @@
+from typing import Tuple, List, Optional
+import geopandas as gpd
+from pathlib import Path
+from shapely.geometry import Point
+from shared.logger import logger
+from shared.db import use_client
+from shared.settings import settings
+from shared.models import Dataset
+from shared.logging import LogContext, LogCategory
+
+# Define the path to the GADM database
+GADM_PATH = Path(settings.GADM_DATA_PATH)
+
+
+def get_gadm_path():
+	"""Get GADM path, downloading if necessary"""
+	if not GADM_PATH.exists():
+		raise FileNotFoundError(
+			f'GADM data file not found at {GADM_PATH}. '
+			'Please run `make download-assets` to download required data files.'
+		)
+	return GADM_PATH
+
+
+def get_admin_tags(
+	point: Tuple[float, float], token: str = None, dataset_id: int = None, user_id: str = None
+) -> List[Optional[str]]:
+	"""
+	Returns administrative names for levels 0 (country), 1 (state/province),
+	and 2 (municipality/district).
+
+	Args:
+	    point: Tuple of (longitude, latitude)
+
+	Returns:
+	    List of [country_name, state_name, district_name]
+	"""
+	try:
+		# Create Point object (lon, lat)
+		point_geom = Point(point[0], point[1])
+
+		# Read only necessary columns and use spatial filter
+		columns = ['NAME_0', 'NAME_2', 'NAME_4', 'geometry']
+		gdf = gpd.read_file(
+			GADM_PATH,
+			mask=point_geom.buffer(0.1),  # Increased from 0.1 to 2.0 degrees
+			columns=columns,
+		)
+
+		if not gdf.empty:
+			mask = gdf.geometry.intersects(point_geom.buffer(0.1))
+			if mask.any():
+				# Get all intersecting polygons
+				intersecting = gdf[mask]
+				# Calculate distances in meters to avoid GeoPandas "geographic CRS" warning.
+				# (GADM data is typically EPSG:4326; distances in degrees are meaningless.)
+				crs = intersecting.crs or 'EPSG:4326'
+				intersecting_m = intersecting.to_crs(epsg=3857)
+				point_m = gpd.GeoSeries([point_geom], crs=crs).to_crs(epsg=3857).iloc[0]
+				distances = intersecting_m.geometry.distance(point_m)
+				# Get the row with minimum distance
+				row = intersecting.iloc[distances.argmin()]
+				return [row['NAME_0'], row['NAME_2'], row['NAME_4']]
+
+		return [None, None, None]
+
+	except Exception as e:
+		logger.error(
+			f'Error getting GADM admin tags: {str(e)}',
+			LogContext(
+				category=LogCategory.METADATA,
+				dataset_id=dataset_id,
+				user_id=user_id,
+				token=token,
+				extra={'error': str(e)},
+			),
+		)
+		return [None, None, None]
+
+
+def update_metadata_admin_level(dataset_id: int, token: str):
+	"""
+	Update the admin level information in the metadata table for a given dataset.
+
+	Args:
+	    dataset_id (int): The ID of the dataset.
+	    token (str): The authentication token.
+	"""
+	# Import here to avoid circular imports
+
+	logger.info(f'Updating admin level information for dataset {dataset_id}', extra={'token': token})
+	try:
+		# Get dataset info
+		with use_client(token) as client:
+			response = client.table(settings.datasets_table).select('*').eq('id', dataset_id).execute()
+			data = Dataset(**response.data[0])
+
+		# Get admin tags using GADM data
+		admin_levels = get_admin_tags(data.centroid, token=token, dataset_id=dataset_id)
+		metadata_update = {
+			'admin_level_1': admin_levels[0],  # country
+			'admin_level_2': admin_levels[1],  # state/province
+			'admin_level_3': admin_levels[2],  # district
+		}
+
+		# Update metadata
+		with use_client(token) as client:
+			client.table(settings.metadata_table).update(metadata_update).eq('dataset_id', dataset_id).execute()
+
+		logger.info(
+			f'Updated admin level information for Dataset {dataset_id}',
+			extra={'token': token, 'dataset_id': dataset_id},
+		)
+		return metadata_update
+
+	except Exception as e:
+		logger.exception(f'Error updating admin levels for dataset {dataset_id}: {str(e)}', extra={'token': token})
+		raise Exception(f'Error updating admin levels for dataset {dataset_id}: {str(e)}')

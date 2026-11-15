@@ -1,0 +1,46 @@
+name: Python Lint
+
+on:
+  pull_request:
+    paths:
+      - "api/**"
+      - "shared/**"
+      - "processor/**"
+      - "deadtrees-cli/**"
+      - "freidata/**"
+      - "scripts/*.py"
+      - "scripts/**/*.py"
+      - "scripts/lint-python.sh"
+      - "pyproject.toml"
+      - ".github/workflows/python-lint.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-lint:
+    name: python-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python tooling
+        run: python -m pip install pytest ruff==0.15.12
+
+      - name: Run critical Python lint
+        run: scripts/lint-python.sh --output-format=github
+
+      - name: Test FreiDATA publisher
+        run: |
+          python -m pip install -r freidata/requirements.txt
+          python -m pytest -q freidata/tests

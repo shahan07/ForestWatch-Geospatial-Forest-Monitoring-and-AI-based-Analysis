@@ -1,0 +1,97 @@
+import logging
+from fastapi import FastAPI
+from starlette.middleware.cors import CORSMiddleware
+
+from shared.__version__ import __version__
+from .routers import (
+	process,
+	upload,
+	info,
+	auth,
+	download,
+	dte_stats,
+	prepackaged,
+	search,
+	priwa_warnkarte,
+	dataset_access,
+	disturbance_benchmark,
+	labeling,
+	audit_images,
+)
+
+from .access.tickets import redact_file_tickets
+
+logging.getLogger('uvicorn.access').addFilter(redact_file_tickets)
+
+app = FastAPI(
+	title='Deadwood-AI API',
+	description='This is the Deadwood-AI API. It is used to manage files uploads to the Deadwood-AI backend and the preprocessing of uploads. Note that the download is managed by a sub-application at `/download/`.',
+	version=__version__,
+	root_path='/api/v1',
+)
+
+# logging.basicConfig(level=logging.INFO)
+
+# Comprehensive CORS configuration
+app.add_middleware(
+	CORSMiddleware,
+	allow_origins=[
+		'https://deadtrees.earth',
+		'https://www.deadtrees.earth',
+		'http://10.4.113.132:5173',
+		'http://localhost:5173',
+	],
+    allow_origin_regex='https://deadwood-d4a4b.*|http://(127\\.0\\.0\\.1|localhost)(:\\d+)?',
+	allow_credentials=True,
+	allow_methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+	# Range lets the map read private COGs in blocks through the API.
+	allow_headers=['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With', 'Range'],
+	expose_headers=['Content-Length', 'Content-Range', 'Accept-Ranges'],
+	max_age=3600,
+)
+
+
+# add the info route to the app
+app.include_router(info.router)
+
+# add the upload route to the app
+app.include_router(upload.router)
+
+
+# add the auth rout to the app
+app.include_router(auth.router)
+
+# add the processing to the app
+app.include_router(process.router)
+
+# add thumbnail route to the app
+# app.include_router(thumbnail.router)
+
+
+# add the DTE stats route (public, no auth)
+app.include_router(dte_stats.router)
+
+# add the public open-vocabulary search query-embedding route
+app.include_router(search.router)
+
+# add authenticated prepackaged dataset catalog and grant routes
+app.include_router(prepackaged.router)
+
+# add PRIWA Warnkarte validation, import, publication, and safe overlay routes
+app.include_router(priwa_warnkarte.router)
+
+# add private dataset files and visibility changes
+app.include_router(dataset_access.router)
+
+# add the core-team disturbance benchmark files
+app.include_router(disturbance_benchmark.router)
+
+# add the signed-in check for the AI labeling service
+app.include_router(labeling.router)
+
+# add the auditor-only images of the automated audit checks
+app.include_router(audit_images.router)
+
+# add the download routes to the app
+# app.include_router(download.download_app)
+app.mount('/download', download.download_app)

@@ -1,0 +1,48 @@
+import "ol/ol.css";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+import "./index.css";
+import AuthProvider from "./hooks/useAuthProvider";
+import DataProvider from "./hooks/useDataProvider";
+import DatasetMapProvider from "./hooks/useDatasetMapProvider";
+import DatasetDetailsMapProvider from "./hooks/useDatasetDetailsMapProvider";
+import { DatasetFilterProvider } from "./hooks/useDatasetFilterProvider";
+import DownloadProvider from "./hooks/useDownloadProvider";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { CookieBanner } from "./components/cookieBanner/CookieBanner";
+import { applyThemeCssVariables } from "./theme/cssVariables";
+import { BrowserRouter } from "react-router-dom";
+import { registerPriwaServiceWorker } from "./pwa/priwaServiceWorker";
+import { reloadForNewBuild } from "./utils/staleBuild";
+
+applyThemeCssVariables();
+registerPriwaServiceWorker();
+
+// Vite fires this when a lazy chunk of the previous deploy is gone. Reload into
+// the new build once; if that already happened, the route error page takes over.
+window.addEventListener("vite:preloadError", (event) => {
+  if (reloadForNewBuild()) event.preventDefault();
+});
+
+const queryClient = new QueryClient();
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <QueryClientProvider client={queryClient}>
+    <BrowserRouter>
+      <AuthProvider>
+        <DataProvider>
+          <DatasetMapProvider>
+            <DatasetDetailsMapProvider>
+              <DatasetFilterProvider>
+                <DownloadProvider>
+                  <App />
+                  <CookieBanner />
+                </DownloadProvider>
+              </DatasetFilterProvider>
+            </DatasetDetailsMapProvider>
+          </DatasetMapProvider>
+        </DataProvider>
+      </AuthProvider>
+    </BrowserRouter>
+  </QueryClientProvider>,
+);

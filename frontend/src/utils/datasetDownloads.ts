@@ -1,0 +1,32 @@
+import { IDataAccess, type IDataset } from "../types/dataset";
+import {
+  isPredictionProcessingComplete,
+  type DatasetProgress,
+} from "./processingSteps";
+
+type DatasetDownloadStatus = DatasetProgress & Pick<IDataset, "data_access">;
+const FULL_DOWNLOAD_ALLOWED_STATUSES = new Set([undefined, "", "idle", "audit_in_progress"]);
+
+function isOdmWorkflow(dataset: DatasetProgress): boolean {
+  return dataset.file_name?.toLowerCase().endsWith(".zip") || false;
+}
+
+/**
+ * Whether the complete bundle (orthophoto included) can be offered. The server decides
+ * full-resolution access (public, owner or download grant); without that answer, view-only
+ * datasets are treated as not downloadable.
+ */
+export function canDownloadCompleteDataset(dataset: DatasetDownloadStatus, fullResolutionAllowed?: boolean): boolean {
+  const odmComplete = !isOdmWorkflow(dataset) || dataset.is_odm_done;
+  return !!(
+    (fullResolutionAllowed ?? dataset.data_access === IDataAccess.public) &&
+    !dataset.has_error &&
+    FULL_DOWNLOAD_ALLOWED_STATUSES.has(dataset.current_status) &&
+    dataset.is_upload_done &&
+    odmComplete &&
+    dataset.is_ortho_done &&
+    dataset.is_metadata_done &&
+    dataset.is_cog_done &&
+    isPredictionProcessingComplete(dataset)
+  );
+}

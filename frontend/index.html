@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/assets/favicon.png" />
+    <link rel="manifest" />
+    <meta name="apple-mobile-web-app-title" content="deadtrees.earth" />
+    <!-- Select installation metadata before the React bundle or auth redirects run. -->
+    <script id="pwa-install-metadata">
+      (() => {
+        const update = () => {
+          let target = new URL(window.location.href);
+          const authRoutes = [
+            "/sign-in",
+            "/sign-up",
+            "/forgot-password",
+            "/reset-password",
+          ];
+          const returnTo = target.searchParams.get("returnTo");
+          if (authRoutes.includes(target.pathname) && returnTo) {
+            try {
+              const destination = new URL(returnTo, target.origin);
+              if (destination.origin === target.origin) target = destination;
+            } catch {
+              // A malformed return address must not change the app identity.
+            }
+          }
+          const isPriwa = /^\/priwa-field\/?$/.test(target.pathname);
+          document
+            .querySelector('link[rel="manifest"]')
+            .setAttribute(
+              "href",
+              isPriwa ? "/priwa.webmanifest" : "/manifest.webmanifest",
+            );
+          document
+            .querySelector('meta[name="apple-mobile-web-app-title"]')
+            .setAttribute("content", isPriwa ? "PRIWA" : "deadtrees.earth");
+        };
+        update();
+        // React Router announces client-side navigation; this script owns app identity.
+        window.addEventListener("deadtrees:route-change", update);
+      })();
+    </script>
+    <link rel="apple-touch-icon" href="/assets/app-icon.png" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#1b5e35" />
+    <!-- Google Search Console ownership check for https://deadtrees.earth/ -->
+    <meta name="google-site-verification" content="zl3-qWbiRVtn1mqTbfXyeBRueMeA1jr3fjujwkW-LdE" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!-- seo-head --><title>deadtrees.earth</title><!-- /seo-head -->
+    <script>
+      !(function (t, e) {
+        var o, n, p, r;
+        e.__SV ||
+          ((window.posthog = e),
+          (e._i = []),
+          (e.init = function (i, s, a) {
+            function g(t, e) {
+              var o = e.split(".");
+              2 == o.length && ((t = t[o[0]]), (e = o[1])),
+                (t[e] = function () {
+                  t.push([e].concat(Array.prototype.slice.call(arguments, 0)));
+                });
+            }
+            ((p = t.createElement("script")).type = "text/javascript"),
+              (p.async = !0),
+              (p.src = s.api_host + "/static/array.js"),
+              (r = t.getElementsByTagName("script")[0]).parentNode.insertBefore(p, r);
+            var u = e;
+            for (
+              void 0 !== a ? (u = e[a] = []) : (a = "posthog"),
+                u.people = u.people || [],
+                u.toString = function (t) {
+                  var e = "posthog";
+                  return "posthog" !== a && (e += "." + a), t || (e += " (stub)"), e;
+                },
+                u.people.toString = function () {
+                  return u.toString(1) + ".people (stub)";
+                },
+                o =
+                  "capture identify alias people.set people.set_once set_config register register_once unregister opt_out_capturing has_opted_out_capturing opt_in_capturing reset isFeatureEnabled onFeatureFlags getFeatureFlag getFeatureFlagPayload reloadFeatureFlags group updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures getActiveMatchingSurveys getSurveys onSessionId".split(
+                    " ",
+                  ),
+                n = 0;
+              n < o.length;
+              n++
+            )
+              g(u, o[n]);
+            e._i.push([i, s, a]);
+          }),
+          (e.__SV = 1));
+      })(document, window.posthog || []);
+      // Don't initialize here - the CookieBanner component will handle this
+      // posthog.init("<project-key-from-env>", {
+      //   api_host: "https://eu.posthog.com",
+      // });
+    </script>
+  </head>
+  <body style="margin: 0">
+    <!-- seo-body --><!-- /seo-body -->
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

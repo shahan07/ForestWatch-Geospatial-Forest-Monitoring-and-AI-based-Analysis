@@ -1,0 +1,326 @@
+const CACHE_VERSION = "deadtrees-app-shell-v3";
+const APP_SHELL_CACHE = CACHE_VERSION;
+const BASEMAP_CACHE_PREFIX = "deadtrees-priwa-basemap-v1";
+const VIEWED_BASEMAP_CACHE = `${BASEMAP_CACHE_PREFIX}-viewed`;
+const BASEMAP_NETWORK_TIMEOUT_MS = 4_000;
+const LGL_BASEMAP_URL_PREFIX =
+  "https://owsproxy.lgl-bw.de/owsproxy/ows/WMTS_LGL-BW_ATKIS_DOP_20_C";
+const TOPOGRAPHIC_TILE_URL_PREFIX =
+  "https://sgx.geodatenzentrum.de/wmts_basemapde/tile/1.0.0/de_basemapde_web_raster_farbe/default/GLOBAL_WEBMERCATOR";
+const APP_SHELL_URLS = [
+  "/",
+  "/deadtrees",
+  "/priwa-field",
+  "/manifest.webmanifest",
+  "/priwa.webmanifest",
+  "/assets/app-icon.png",
+  "/assets/favicon.png",
+  "/assets/tree-icon.png",
+];
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches
+      .open(APP_SHELL_CACHE)
+      .then((cache) =>
+        cache.addAll(
+          APP_SHELL_URLS.map((url) => new Request(url, { cache: "reload" })),
+        ),
+      )
+      .then(() => self.skipWaiting()),
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((cacheNames) =>
+        Promise.all(
+          cacheNames
+            .filter(
+              (cacheName) =>
+                (cacheName.startsWith("deadtrees-app-shell-") &&
+                  cacheName !== APP_SHELL_CACHE) ||
+                (cacheName.startsWith("deadtrees-priwa-") &&
+                  (cacheName === VIEWED_BASEMAP_CACHE ||
+                    !cacheName.startsWith(BASEMAP_CACHE_PREFIX))),
+            )
+            .map((cacheName) => caches.delete(cacheName)),
+        ),
+      )
+      .then(() => self.clients.claim()),
+  );
+});
+
+const cacheSuccessfulResponse = async (request, response) => {
+  if (!response || !response.ok) return response;
+
+  const cache = await caches.open(APP_SHELL_CACHE);
+  await cache.put(request, response.clone());
+  return response;
+};
+
+const handleNavigation = async (request) => {
+  try {
+    const response = await fetch(request);
+    return cacheSuccessfulResponse(request, response);
+  } catch {
+    const cache = await caches.open(APP_SHELL_CACHE);
+    return (
+      (await cache.match(request)) ||
+      (await cache.match("/priwa-field")) ||
+      (await cache.match("/")) ||
+      new Response(
+        "deadtrees.earth is offline and the app shell is unavailable.",
+        {
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+          status: 503,
+          statusText: "Offline",
+        },
+      )
+    );
+  }
+};
+
+const handleSameOriginAsset = async (request) => {
+  const cache = await caches.open(APP_SHELL_CACHE);
+  const cachedResponse = await cache.match(request);
+  const networkResponsePromise = fetch(request)
+    .then((response) => cacheSuccessfulResponse(request, response))
+    .catch(
+      () =>
+        cachedResponse ||
+        new Response("", {
+          status: 503,
+          statusText: "Offline",
+        }),
+    );
+
+  return cachedResponse || networkResponsePromise;
+};
+
+const isLglBasemapTileRequest = (requestUrl) =>
+  requestUrl.href.startsWith(LGL_BASEMAP_URL_PREFIX);
+
+const isTopographicTileRequest = (requestUrl) =>
+  requestUrl.href.startsWith(`${TOPOGRAPHIC_TILE_URL_PREFIX}/`);
+
+const isBasemapTileRequest = (requestUrl) =>
+  isLglBasemapTileRequest(requestUrl) || isTopographicTileRequest(requestUrl);
+
+const getSearchParamCaseInsensitive = (searchParams, key) => {
+  const targetKey = key.toLowerCase();
+  for (const [candidateKey, value] of searchParams.entries()) {
+    if (candidateKey.toLowerCase() === targetKey) {
+      return value;
+    }
+  }
+
+  return null;
+};
+
+const appendWmtsParams = (url, params) => {
+  const queryString = Object.entries(params)
+    .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+    .join("&");
+
+  return `${url.replace(/[?&]$/, "")}${url.includes("?") ? "&" : "?"}${queryString}`;
+};
+
+const canonicalizeLglBasemapRequest = (request) => {
+  const url = new URL(request.url);
+  const tileMatrix = getSearchParamCaseInsensitive(
+    url.searchParams,
+    "TileMatrix",
+  );
+  const tileCol = getSearchParamCaseInsensitive(url.searchParams, "TileCol");
+  const tileRow = getSearchParamCaseInsensitive(url.searchParams, "TileRow");
+
+  if (!tileMatrix || !tileCol || !tileRow) {
+    return request;
+  }
+
+  const baseUrl = appendWmtsParams(LGL_BASEMAP_URL_PREFIX, {
+    layer: "DOP_20_C",
+    style: "default",
+    tilematrixset: "GoogleMapsCompatible",
+    Service: "WMTS",
+    Request: "GetTile",
+    Version: "1.0.0",
+    Format: "image/jpeg",
+  });
+
+  return new Request(
+    appendWmtsParams(baseUrl, {
+      TileMatrix: tileMatrix,
+      TileCol: tileCol,
+      TileRow: tileRow,
+    }),
+    request,
+  );
+};
+
+const canonicalizeTopographicTileRequest = (request) => {
+  const url = new URL(request.url);
+  if (!isTopographicTileRequest(url)) {
+    return request;
+  }
+
+  return new Request(
+    `${url.origin}${url.pathname.replace(/\/+/g, "/")}`,
+    request,
+  );
+};
+
+const canonicalizeBasemapRequest = (request) => {
+  const url = new URL(request.url);
+
+  if (isLglBasemapTileRequest(url)) {
+    return canonicalizeLglBasemapRequest(request);
+  }
+
+  if (isTopographicTileRequest(url)) {
+    return canonicalizeTopographicTileRequest(request);
+  }
+
+  return request;
+};
+
+const createOfflineTileResponse = () =>
+  new Response("", {
+    status: 503,
+    statusText: "Offline",
+  });
+
+const makeCachedTileReplayable = async (response) => {
+  if (!response) {
+    return response;
+  }
+
+  return new Response(await response.blob(), {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+};
+
+const isExplicitBasemapCacheName = (cacheName) =>
+  cacheName.startsWith(BASEMAP_CACHE_PREFIX) &&
+  cacheName !== VIEWED_BASEMAP_CACHE;
+
+const matchReplayableBasemapResponse = async (cache, requests) => {
+  for (const request of requests) {
+    const response = await cache.match(request, { ignoreVary: true });
+    if (response?.type === "opaque") {
+      await cache.delete(request, { ignoreVary: true });
+      continue;
+    }
+    if (response) {
+      return response;
+    }
+  }
+
+  return null;
+};
+
+const matchExplicitBasemapPackage = async (requests) => {
+  const cacheNames = await caches.keys();
+
+  for (const cacheName of cacheNames) {
+    if (!isExplicitBasemapCacheName(cacheName)) {
+      continue;
+    }
+
+    const cache = await caches.open(cacheName);
+    const response = await matchReplayableBasemapResponse(cache, requests);
+    if (response) {
+      return response;
+    }
+  }
+
+  return null;
+};
+
+const matchExplicitBasemapResponse = async (requests) => {
+  const response = await matchExplicitBasemapPackage(requests);
+  return response ? makeCachedTileReplayable(response) : null;
+};
+
+const fetchBasemapWithTimeout = async (request) => {
+  const controller = new AbortController();
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(new Error("Basemap tile request timed out"));
+    }, BASEMAP_NETWORK_TIMEOUT_MS);
+  });
+
+  try {
+    return await Promise.race([
+      fetch(request, { signal: controller.signal }),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+const handleBasemapTile = async (request) => {
+  const canonicalRequest = canonicalizeBasemapRequest(request);
+  const cacheRequests = [canonicalRequest, request];
+
+  if (self.navigator && self.navigator.onLine === false) {
+    return (
+      (await matchExplicitBasemapResponse(cacheRequests)) ||
+      createOfflineTileResponse()
+    );
+  }
+
+  try {
+    const networkResponse = await fetchBasemapWithTimeout(request);
+    if (networkResponse.ok || networkResponse.type === "opaque") {
+      return networkResponse;
+    }
+    return (
+      (await matchExplicitBasemapResponse(cacheRequests)) || networkResponse
+    );
+  } catch {
+    return (
+      (await matchExplicitBasemapResponse(cacheRequests)) ||
+      createOfflineTileResponse()
+    );
+  }
+};
+
+self.addEventListener("fetch", (event) => {
+  const { request } = event;
+  const requestUrl = new URL(request.url);
+
+  if (request.method !== "GET") {
+    return;
+  }
+
+  if (isBasemapTileRequest(requestUrl)) {
+    event.respondWith(handleBasemapTile(request));
+    return;
+  }
+
+  if (requestUrl.origin !== self.location.origin) {
+    return;
+  }
+
+  if (request.mode === "navigate") {
+    event.respondWith(handleNavigation(request));
+    return;
+  }
+
+  if (
+    ["font", "image", "manifest", "script", "style", "worker"].includes(
+      request.destination,
+    )
+  ) {
+    event.respondWith(handleSameOriginAsset(request));
+  }
+});

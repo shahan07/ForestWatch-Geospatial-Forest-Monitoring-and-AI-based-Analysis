@@ -1,0 +1,117 @@
+import { Suspense } from "react";
+import { Button, Segmented, Typography } from "antd";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { RequireAuth } from "../AuthGate";
+import { useCanOperate } from "../../hooks/useUserPrivileges";
+import { FactorySelectionProvider } from "./FactorySelectionContext";
+import FactorySelectionTray from "./FactorySelectionTray";
+import { ReadOnlyBadge } from "./FactoryPrimitives";
+import StatusPage from "../StatusPage";
+import { PageSkeleton } from "../PageSkeletons";
+import { SectionSkeleton } from "../SectionStates";
+
+const { Title, Text } = Typography;
+
+type FactorySection = "overview" | "operations" | "datasets" | "activity";
+
+const SECTION_PATHS: Record<FactorySection, string> = {
+	overview: "/factory",
+	operations: "/factory/operations",
+	datasets: "/factory/datasets",
+	activity: "/factory/activity",
+};
+
+function sectionFromPath(pathname: string): FactorySection {
+	if (pathname.startsWith("/factory/operations")) return "operations";
+	if (pathname.startsWith("/factory/datasets")) return "datasets";
+	if (pathname.startsWith("/factory/activity")) return "activity";
+	return "overview";
+}
+
+function FactoryShell() {
+	const { canOperate, isLoading, isError, refetch } = useCanOperate();
+	const location = useLocation();
+	const navigate = useNavigate();
+
+	if (isLoading) return <PageSkeleton label="Checking access" />;
+
+	if (isError) {
+		return (
+			<StatusPage
+				kind="offline"
+				title="The Factory couldn’t load"
+				description="DeadTrees didn’t respond while checking your access. Check your connection and try again in a moment."
+				actions={
+					<Button type="primary" onClick={() => void refetch()}>
+						Try again
+					</Button>
+				}
+			/>
+		);
+	}
+
+	if (!canOperate) {
+		return (
+			<StatusPage
+				kind="locked"
+				title="Operator access required"
+				description="The Factory workspace is limited to DeadTrees operators. Ask the team if you need it."
+				actions={
+					<Button type="primary" onClick={() => navigate("/")}>
+						Go to home
+					</Button>
+				}
+			/>
+		);
+	}
+
+	const section = sectionFromPath(location.pathname);
+
+	return (
+		<FactorySelectionProvider>
+			<div className="w-full bg-[#F8FAF9] min-h-[100dvh] pb-32 pt-24 md:pt-28" data-testid="factory-page">
+				<div className="mx-auto max-w-[1920px] px-4 md:px-8 xl:px-12">
+					<header className="mb-6 flex flex-wrap items-start justify-between gap-4">
+						<div>
+							<div className="flex items-center gap-3">
+								<Title level={2} style={{ margin: 0, fontWeight: 700 }}>
+									Factory
+								</Title>
+								<ReadOnlyBadge />
+							</div>
+							<Text type="secondary" className="mt-1 block max-w-2xl">
+								Whether DeadTrees turns contributions into trusted, reused data, and where work waits. These pages
+								are read-only apart from sharing a dataset; copy the facts and hand them on.
+							</Text>
+						</div>
+						<Segmented<FactorySection>
+							size="large"
+							className="shadow-sm border border-gray-200/50"
+							value={section}
+							onChange={(value) => navigate(SECTION_PATHS[value])}
+							options={[
+								{ label: "Overview", value: "overview" },
+								{ label: "Operations", value: "operations" },
+								{ label: "Datasets", value: "datasets" },
+								{ label: "Activity", value: "activity" },
+							]}
+						/>
+					</header>
+					<Suspense fallback={<SectionSkeleton rows={8} label="Loading section" />}>
+						<Outlet />
+					</Suspense>
+				</div>
+			</div>
+			<FactorySelectionTray />
+		</FactorySelectionProvider>
+	);
+}
+
+/** Route element for `/factory/*`: authentication first, then the operator gate, then the workspace shell. */
+export default function FactoryLayout() {
+	return (
+		<RequireAuth>
+			<FactoryShell />
+		</RequireAuth>
+	);
+}

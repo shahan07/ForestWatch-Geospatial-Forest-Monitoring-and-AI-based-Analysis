@@ -1,0 +1,311 @@
+import os
+import tempfile
+import time
+from typing import Callable
+from pathlib import Path
+
+import numpy as np
+import rasterio
+import shapely
+import torch
+import torch.nn.functional as F
+from safetensors import safe_open
+from shapely.geometry import MultiPolygon, Polygon
+from simplification.cutil import simplify_coords_vw
+from transformers import SegformerConfig, SegformerForSemanticSegmentation
+
+from processor.src.utils.geometry_validation import repair_polygon
+from processor.src.utils.inference_dataset import MASK_TIFF_LAYOUT, InferenceDataset, normalize_imagenet, predict_tiles
+from processor.src.utils.segmentation import (
+    filter_polygons_by_area,
+    image_reprojector,
+    mask_to_polygons_in_blocks,
+    mask_to_polygons_scanline,
+    reproject_polygons,
+)
+
+# Class indices as defined in the training config (config/base_segformer.yml)
+CLASS_BACKGROUND = 0
+CLASS_TREECOVER = 1
+CLASS_DEADWOOD = 2
+
+MINIMUM_INFERENCE_RESOLUTION = 0.05  # metres — match deadwood_v1
+BATCH_SIZE = 2
+MINIMUM_POLYGON_AREA = 0.1  # m²
+TILE_SIZE = 1024
+PADDING = 256
+
+# Polygon postprocessing applied to both deadwood and treecover polygons.
+# Pixel-traced masks at 5cm carry huge runs of redundant near-collinear staircase
+# vertices. The Auwald simplification study (temp/auwald_simplification_study.*)
+# compared methods on real forest-cover; "VW 0.0625 + Chaikin x1" won: ~82% vertex
+# savings (on par with Douglas-Peucker 10cm) but with smoother, less staircased
+# boundaries and fewer spurious tiny features/holes. We run it in two passes, both
+# in the metric inference CRS so the area threshold is in m²:
+#   1. Visvalingam-Whyatt simplification at a 0.0625 m² effective-area threshold.
+#   2. One Chaikin corner-cutting smoothing pass.
+VW_AREA_THRESHOLD = 0.0625  # m² — Visvalingam-Whyatt effective-area threshold
+CHAIKIN_ITERATIONS = 1      # corner-cutting smoothing passes after VW
+# Chaikin cuts each corner a quarter of the way along its segments. Splitting longer
+# segments first keeps every boundary within 25 cm of the simplified one.
+MAX_SMOOTHING_SEGMENT = 1.0  # m
+
+# Treecover is polygonized in fixed blocks so no single forest polygon spans a whole
+# tile: one polygon with 87k holes and 5M vertices kept post-processing busy for hours
+# and is too heavy for the database and map (DT-1379). Each block is read with a
+# margin, simplified, then clipped to the block, so neighbours meet without gaps.
+TREECOVER_BLOCK_SIZE = 4096  # pixels; about 200 m at the 5 cm inference resolution
+TREECOVER_BLOCK_PADDING = 128  # pixels; well beyond how far VW and Chaikin move a boundary
+# The area filter sees each polygon within its padded block. Anything reaching the block
+# crosses the 128 px margin, so it covers at least 128 px and passes the 0.1 m² filter at
+# any resolution from 5 cm up. Clipping may leave smaller pieces along the block lines;
+# they are parts of larger polygons and are kept, so no forest goes missing at a seam.
+
+
+def _explode_polygons(geom):
+    """Flatten a geometry into its constituent (non-empty) Polygons."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == 'Polygon':
+        return [geom]
+    if geom.geom_type in ('MultiPolygon', 'GeometryCollection'):
+        return [p for g in geom.geoms for p in _explode_polygons(g)]
+    return []
+
+
+def _chaikin_ring(coords, iterations):
+    """Chaikin corner-cutting on a single closed ring; returns a closed coord list."""
+    pts = [tuple(c) for c in coords]
+    if len(pts) > 1 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    for _ in range(iterations):
+        new_pts = []
+        n = len(pts)
+        for i in range(n):
+            p0 = pts[i]
+            p1 = pts[(i + 1) % n]
+            new_pts.append((0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1]))
+            new_pts.append((0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1]))
+        pts = new_pts
+    pts.append(pts[0])
+    return pts
+
+
+def _chaikin_polygon(polygon, iterations):
+    """Apply Chaikin smoothing to a polygon's exterior and interior rings."""
+    ext = _chaikin_ring(polygon.exterior.coords, iterations)
+    holes = [_chaikin_ring(r.coords, iterations) for r in polygon.interiors if len(r.coords) >= 4]
+    return repair_polygon(Polygon(ext, holes))
+
+
+def _vw_simplify_polygon(polygon, area_threshold):
+    """Visvalingam-Whyatt simplification of a polygon's rings; None if the exterior
+    collapses below a triangle."""
+    ext = simplify_coords_vw(np.asarray(polygon.exterior.coords), area_threshold)
+    if len(ext) < 4:
+        return None
+    holes = []
+    for ring in polygon.interiors:
+        coords = np.asarray(ring.coords)
+        hole = simplify_coords_vw(coords, area_threshold)
+        # Keep the original ring if VW collapses it below a triangle, so a valid hole
+        # (it already passed the area filter) is never silently filled in.
+        holes.append(hole if len(hole) >= 4 else coords)
+    return repair_polygon(Polygon(ext, holes))
+
+
+def _simplify_and_smooth(polygon):
+    """VW simplification + Chaikin smoothing for one polygon (both in metric CRS).
+
+    Returns a list of Polygons. Falls back to ``[polygon]`` unchanged if the pipeline
+    collapses or errors, so no feature is silently dropped. A ``buffer(0)`` repair may
+    split a polygon into several, hence the list return.
+    """
+    try:
+        simplified = _vw_simplify_polygon(polygon, VW_AREA_THRESHOLD)
+        if simplified is None or simplified.is_empty:
+            return [polygon]
+        simplified = shapely.segmentize(simplified, MAX_SMOOTHING_SEGMENT)
+        smoothed = []
+        for part in _explode_polygons(simplified):
+            smoothed.extend(_explode_polygons(_chaikin_polygon(part, CHAIKIN_ITERATIONS)))
+        return smoothed if smoothed else [polygon]
+    except Exception:
+        return [polygon]
+
+
+def _build_model_config() -> SegformerConfig:
+    # mit-b3 architecture (depths [3,4,18,3] confirmed from checkpoint inspection)
+    return SegformerConfig(
+        num_channels=3,
+        num_encoder_blocks=4,
+        depths=[3, 4, 18, 3],
+        sr_ratios=[8, 4, 2, 1],
+        hidden_sizes=[64, 128, 320, 512],
+        patch_sizes=[7, 3, 3, 3],
+        strides=[4, 2, 2, 2],
+        num_attention_heads=[1, 2, 5, 8],
+        mlp_ratios=[4, 4, 4, 4],
+        hidden_act='gelu',
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        classifier_dropout_prob=0.0,
+        initializer_range=0.02,
+        drop_path_rate=0.1,
+        layer_norm_eps=1e-6,
+        decoder_hidden_size=768,
+        num_labels=3,
+        id2label={0: 'background', 1: 'treecover', 2: 'deadwood'},
+        label2id={'background': 0, 'treecover': 1, 'deadwood': 2},
+        semantic_loss_ignore_index=255,
+    )
+
+
+class CombinedInference:
+    """Runs the combined deadwood+treecover SegFormer-B3 model and returns
+    separate polygon lists for each class."""
+
+    def __init__(self, model_path: str):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # fp16 weights on the GPU are ~2.3x faster than fp32 and keep the binarized
+        # deadwood and treecover masks at IoU >= 0.998 against fp32. (Autocast is not
+        # used: it keeps attention softmax in fp32 and needs more memory than fp32.)
+        self.dtype = torch.float16 if self.device.type == 'cuda' else torch.float32
+        self.model = self._load_model(model_path)
+
+    def _load_model(self, model_path: str) -> SegformerForSemanticSegmentation:
+        # Checkpoint was saved from a wrapper class (self.model = ...), so all
+        # keys are prefixed with "model.". Strip that prefix before loading.
+        state_dict = {}
+        with safe_open(model_path, framework='pt', device='cpu') as f:
+            for key in f.keys():
+                new_key = key[len('model.'):] if key.startswith('model.') else key
+                state_dict[new_key] = f.get_tensor(key)
+
+        model = SegformerForSemanticSegmentation(_build_model_config())
+        model.load_state_dict(state_dict, strict=True)
+        model = model.to(device=self.device, dtype=self.dtype)
+        model.eval()
+        return model
+
+    def predict(self, images: torch.Tensor) -> torch.Tensor:
+        """(B, 3, H, W) uint8 tiles -> (B, H, W) uint8 class map."""
+        logits = self.model(pixel_values=normalize_imagenet(images, self.dtype)).logits
+        logits = F.interpolate(logits.float(), size=images.shape[-2:], mode='bilinear', align_corners=False)
+        return logits.argmax(dim=1).to(torch.uint8)
+
+    def inference(self, input_tif: str, progress: Callable[[str], None] = print) -> tuple[list, list]:
+        """Run inference on a GeoTIFF and return (deadwood_polygons, treecover_polygons)
+        in the CRS of the input file.
+
+        ``progress`` receives one line per post-processing step. On dense forest the
+        polygon steps can take hours on one core (DT-1379), so they report their timing.
+        """
+        dataset = InferenceDataset(
+            lambda: image_reprojector(input_tif, min_res=MINIMUM_INFERENCE_RESOLUTION),
+            tile_size=TILE_SIZE,
+            padding=PADDING,
+            skip_nodata_tiles=True,
+        )
+        vrt_src = dataset.image_src
+
+        tmp_class_path = None
+        tmp_treecover_path = None
+        try:
+            # Two temp GeoTIFFs written tile-by-tile during inference so the full
+            # class map never lives in RAM. Nodata is zeroed per tile by predict_tiles,
+            # avoiding a full-res dataset_mask() load entirely.
+            with tempfile.NamedTemporaryFile(suffix='_class.tif', delete=False) as f:
+                tmp_class_path = f.name
+            with tempfile.NamedTemporaryFile(suffix='_treecover.tif', delete=False) as f:
+                tmp_treecover_path = f.name
+
+            tif_kwargs = dict(
+                driver='GTiff',
+                height=dataset.height,
+                width=dataset.width,
+                count=1,
+                dtype=np.uint8,
+                crs=vrt_src.crs,
+                transform=vrt_src.transform,
+                **MASK_TIFF_LAYOUT,
+            )
+            with (
+                rasterio.open(tmp_class_path, 'w', **tif_kwargs) as dst_class,
+                rasterio.open(tmp_treecover_path, 'w', **tif_kwargs) as dst_treecover,
+            ):
+                for out_window, class_arr in predict_tiles(dataset, self.predict, self.device, BATCH_SIZE):
+                    dst_class.write(class_arr, 1, window=out_window)
+                    dst_treecover.write((class_arr > 0).astype(np.uint8), 1, window=out_window)
+
+            src_crs = vrt_src.crs
+            vrt_src.close()
+
+            with rasterio.open(input_tif) as src:
+                orig_crs = src.crs
+
+            # Polygonize directly from the temp files — GDAL reads scanline-by-scanline
+            # so no full-res array is materialised. Deadwood is a subset of treecover;
+            # the treecover file stores 1 wherever class != background so they merge
+            # naturally without a union step.
+            progress('Combined inference finished; polygonizing deadwood')
+            deadwood_polygons = self._polygons_from_mask(tmp_class_path, CLASS_DEADWOOD, 'deadwood', src_crs, orig_crs, progress)
+            treecover_polygons = self._treecover_polygons_in_blocks(tmp_treecover_path, src_crs, orig_crs, progress)
+            return deadwood_polygons, treecover_polygons
+
+        finally:
+            for p in (tmp_class_path, tmp_treecover_path):
+                if p and os.path.exists(p):
+                    os.unlink(p)
+
+    def _polygons_from_mask(self, mask_path, class_value, name, inference_crs, orig_crs, progress):
+        started = time.monotonic()
+        with rasterio.open(mask_path) as ds:
+            polygons = mask_to_polygons_scanline(ds, class_value)
+        largest = max((len(p.interiors) for p in polygons), default=0)
+        progress(
+            f'Polygonized {name}: {len(polygons)} polygons, up to {largest} holes in one, '
+            f'in {time.monotonic() - started:.0f} s; simplifying'
+        )
+        started = time.monotonic()
+        polygons = self._filter_polygons(polygons, inference_crs, orig_crs)
+        progress(f'Simplified {name} to {len(polygons)} polygons in {time.monotonic() - started:.0f} s')
+        return polygons
+
+    def _treecover_polygons_in_blocks(self, mask_path, inference_crs, orig_crs, progress):
+        started = time.monotonic()
+        polygons = []
+        with rasterio.open(mask_path) as ds:
+            for core_bounds, block_polygons in mask_to_polygons_in_blocks(
+                ds, 1, TREECOVER_BLOCK_SIZE, TREECOVER_BLOCK_PADDING
+            ):
+                # A full intersection, not clip_by_rect: GEOS's rectangle clipping can build
+                # a three-point ring where a boundary runs along the block edge (13412).
+                block = shapely.box(*core_bounds)
+                for polygon in self._simplify_polygons(block_polygons):
+                    for part in _explode_polygons(polygon.intersection(block)):
+                        polygons.extend(_explode_polygons(repair_polygon(part)))
+        largest = max((len(p.interiors) for p in polygons), default=0)
+        progress(
+            f'Polygonized and simplified treecover in {TREECOVER_BLOCK_SIZE} px blocks: {len(polygons)} polygons, '
+            f'up to {largest} holes in one, in {time.monotonic() - started:.0f} s'
+        )
+        return reproject_polygons(polygons, inference_crs, orig_crs)
+
+    def _filter_polygons(self, polygons, inference_crs, orig_crs):
+        return reproject_polygons(self._simplify_polygons(polygons), inference_crs, orig_crs)
+
+    def _simplify_polygons(self, polygons):
+        polygons = filter_polygons_by_area(polygons, MINIMUM_POLYGON_AREA)
+        # Simplify + smooth while still in the metric inference CRS so the VW area
+        # threshold is in m². Each input polygon yields one or more output polygons;
+        # on collapse it falls back to the original so no label is silently dropped.
+        simplified = []
+        for polygon in polygons:
+            simplified.extend(_simplify_and_smooth(polygon))
+        # Re-filter by area: a buffer(0) repair can split one polygon into several,
+        # and VW/Chaikin can shrink one below the threshold, so sub-area slivers must
+        # not slip past the pre-simplification filter.
+        simplified = filter_polygons_by_area(simplified, MINIMUM_POLYGON_AREA)
+        print(f'Simplified {len(polygons)} polygons (VW {VW_AREA_THRESHOLD}m² + Chaikin x{CHAIKIN_ITERATIONS}).')
+        return simplified

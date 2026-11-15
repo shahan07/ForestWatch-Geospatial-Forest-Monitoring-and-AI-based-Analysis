@@ -1,0 +1,144 @@
+# DeadTrees Frontend Agent Instructions
+
+Read this in addition to the root `AGENTS.md` and `docs/agents/rules.md` for
+frontend work.
+
+## Stack
+
+- React + TypeScript + Vite
+- Ant Design and Tailwind
+- OpenLayers for maps and COG rendering
+- Supabase client for auth and data access
+- React Query for server state
+
+## Environment
+
+- `npm run dev:local` loads `frontend/.env.dev.local` for local API/Supabase.
+- `npm run dev:prod` loads `frontend/.env.prod.local` for local UI against
+  production services.
+- Only browser-safe `VITE_*` values belong in frontend env files.
+- Never put service-role keys, MCP tokens, SSH/VPN credentials, or private API
+  keys in `frontend/.env*`.
+
+## Ant Design And Tailwind
+
+Tailwind's base reset (preflight) is off so that it does not fight Ant Design.
+A plain `<button>`, `<input>` or `<select>` therefore keeps the browser's own
+look, for example a 3D border. Use the Ant Design control (`Button`,
+`Radio.Group`, `Checkbox`, `Tag.CheckableTag`, `Input`) instead of styling a
+native one with Tailwind classes.
+
+## TypeScript And React
+
+- Prefix domain interfaces with `I` where that pattern already exists.
+- Use `Props` suffixes for component props.
+- Keep large components below roughly 200 lines by extracting hooks,
+  subcomponents, render helpers, or config.
+- Use React Query for Supabase/server state and local state for UI-only state.
+- Keep global context limited to auth, map viewport, theme, or similarly broad
+  cross-cutting state.
+- Prefer `console.debug()` over `console.log()`.
+
+## Review guidelines
+
+- Apply the root review guidelines, especially for correctness, security, maintainability, and testability risks in changed frontend code.
+- Flag frontend changes that expose service-role keys, MCP tokens, SSH/VPN credentials, private API keys, or production-only values to browser code or tracked `frontend/.env*` files.
+- Flag auth, Supabase, React Query, upload, map, or COG-rendering changes that make permissions, cache invalidation, cancellation, cleanup, or error states hard to reason about or hard to test.
+- Treat large React components, duplicated data-fetching logic, unstable query keys, missing cleanup of OpenLayers resources, and hidden side effects as review issues when they create concrete regression risk.
+- Do not flag subjective UI style preferences unless they affect accessibility, data integrity, security, testability, or a documented product requirement.
+
+## Search And Link Previews
+
+`src/seo/pageMeta.ts` owns each URL's title, description, robots rule and
+structured data. Add new public routes there, and new private routes to its
+noindex list. A page refines its metadata with `usePageMetaOverride`, never by
+setting `document.title`. The build writes static HTML and the sitemap from the
+same module.
+
+## Loading, Empty And Error States
+
+Use the shared kit instead of spinners, "Loading…" strings or antd `Empty`,
+`Result` and error `Alert`s:
+
+- Whole page: `PageSkeleton` or `MapPageSkeleton` (`components/PageSkeletons.tsx`)
+  while it loads; `StatusPage` for not found, no access, offline or failed.
+- Section (table, list, card, chart, modal body): `SectionSkeleton`,
+  `TableSkeleton`, `ListSkeleton` or `MapSkeleton`; `EmptyStatePanel` when
+  empty; `SectionLoadError` ("X couldn’t load" plus "Try again") when it fails.
+- Inline value or small panel: `InlineSkeleton`, `InlineEmpty`,
+  `InlineLoadError` (`components/SectionStates.tsx`).
+- Label loading states with `aria-label`, never visible text. Spinners only on
+  a button or map control the user just pressed. Toasts only for failed
+  actions, never for failed loads.
+
+## Query Keys
+
+Use stable tuple keys:
+
+```ts
+const datasetId = 123;
+const allDatasetsKey = ["datasets"];
+const datasetKey = ["datasets", datasetId];
+const datasetLabelsKey = ["datasets", datasetId, "labels"];
+```
+
+## OpenLayers
+
+- Do not store `Map` instances in React state. Use refs.
+- Always cleanup layers, sources, listeners, and `map.setTarget(undefined)`.
+- Use `fromLonLat` and `toLonLat` for coordinate transforms.
+- Use `WebGLTileLayer` with `GeoTIFF` for COG rendering.
+
+## Uploads
+
+- Chunk size is 50 MB.
+- Refresh auth before long-running chunk uploads.
+- Use `AbortController` for cancellation.
+
+## Validation
+
+Use `docs/agents/testing-strategy.md` first to choose the right test surface and
+mocking level. For frontend work, test-plan-first does not always mean strict
+red-green TDD: prototype visual/map interactions when needed, then add or run a
+durable regression check before merge.
+
+Run targeted checks first:
+
+```bash
+npm --prefix frontend test
+npm --prefix frontend run test:e2e
+```
+
+Use `npm --prefix frontend run test:e2e:local` for authenticated contributor
+upload-shell changes. It is intentionally separate from the production-read
+smoke suite.
+
+Use `npm --prefix frontend run test:e2e:local:write` only when the local
+Supabase/API/Mailpit stack is running and the change needs real local
+signup/password-reset/upload/download side-effect coverage. This suite mutates
+local auth, database, mail, and storage state and cleans up after itself.
+
+Use `npm --prefix frontend run test:e2e:local:audit` for auditor-only queue,
+audit-tab, processing-log, and audit access guard changes. It uses mocked local
+Supabase responses and must stay production-write safe.
+
+Use `npm --prefix frontend run test:e2e:local:audit:write` only when the local
+Supabase/API/nginx stack is running and the change needs real auditor write
+side-effect coverage for flag acknowledgement, AOI save, audit lock release, or
+`dataset_audit` persistence.
+
+Use `npm --prefix frontend run test:e2e:local:sharing:write` for named dataset
+sharing and access changes, and `npm --prefix frontend run test:e2e:local:priwa:write`
+for PRIWA field-app write flows. Both need the isolated local stack and mutate
+only local state.
+
+For user-facing UI changes, start the relevant Vite profile and validate with the
+agent's built-in browser (Codex in-app browser or Claude's browser pane) or Playwright. Use `docs/playbooks/frontend-browser-regression.md`
+for production-connected smoke checks.
+
+`npm --prefix frontend run build` and `npm --prefix frontend run lint` are
+required frontend checks. Treat failures as blocking for frontend changes unless
+the failure is clearly unrelated and documented.
+Run `scripts/lint-ast-grep.sh` from the repo root after frontend changes that
+touch E2E tests, environment usage, browser-debug code, or production-connected
+flows. The ast-grep rules are repo-specific guardrails, not formatting rules.

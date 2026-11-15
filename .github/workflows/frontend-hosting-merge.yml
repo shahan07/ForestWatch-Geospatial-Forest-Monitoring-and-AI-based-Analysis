@@ -1,0 +1,47 @@
+name: Frontend Deploy Live
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-hosting-merge.yml'
+      - '.github/workflows/frontend-hosting-pull-request.yml'
+
+concurrency:
+  group: frontend-production
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-deploy:
+    name: frontend-deploy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      VITE_MODE: production
+      VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      VITE_POSTHOG_PROJECT_KEY: ${{ secrets.VITE_POSTHOG_PROJECT_KEY }}
+      VITE_POSTHOG_API_HOST: ${{ vars.VITE_POSTHOG_API_HOST }}
+      VITE_GEOPIFY_KEY: ${{ secrets.VITE_GEOPIFY_KEY }}
+      VITE_TURNSTILE_SITE_KEY: ${{ vars.VITE_TURNSTILE_SITE_KEY }}
+      VITE_SUPABASE_SENTINEL_PROCESSING_URL: ${{ secrets.VITE_SUPABASE_SENTINEL_PROCESSING_URL }}
+      VITE_SUPABASE_SENTINEL_PROCESSING_ANON_KEY: ${{ secrets.VITE_SUPABASE_SENTINEL_PROCESSING_ANON_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci
+      - name: Deploy to Firebase Hosting live
+        env:
+          FIREBASE_CLI_EXPERIMENTS: webframeworks
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DEADWOOD_D4A4B }}
+          FIREBASE_AUTH_MODE: access-token
+          FIREBASE_PROJECT_ID: deadwood-d4a4b
+          FIREBASE_TOOLS_VERSION: 15.22.2
+          FIREBASE_DEPLOY_ATTEMPTS: 8
+        run: ../.github/scripts/firebase-hosting-deploy.sh live

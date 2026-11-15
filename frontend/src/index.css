@@ -1,0 +1,648 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Theme variables are injected at runtime from src/theme/palette.ts */
+
+.dt-full-height-layout {
+  height: 100dvh;
+}
+
+/* WebKit can exclude the bottom safe area from dvh in installed web apps.
+ * Legacy vh includes that inset, keeping full-screen map routes edge-to-edge. */
+@media (display-mode: standalone) {
+  .dt-full-height-layout {
+    height: 100vh;
+  }
+}
+
+/* Shared OpenLayers controls for public maps */
+.dt-map-attribution-control {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  right: auto;
+  max-width: min(440px, calc(100% - 24px));
+  background-color: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.14);
+  padding: 3px 7px;
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+  z-index: 40;
+}
+
+.dt-map-attribution-control.ol-collapsed {
+  width: auto;
+  max-width: none;
+  padding: 2px;
+}
+
+.dt-map-attribution-control.ol-collapsed ul {
+  display: none;
+}
+
+.dt-map-attribution-control:not(.ol-collapsed) ul {
+  display: inline;
+}
+
+.dt-map-zoom-control {
+  top: auto !important;
+  bottom: 12px !important;
+  right: 16px !important;
+  left: auto !important;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  z-index: 40;
+}
+
+.dt-map-zoom-control button {
+  width: 36px;
+  height: 36px;
+  margin: 0 !important;
+  border: 1px solid rgba(148, 163, 184, 0.28) !important;
+  border-radius: 12px !important;
+  background: rgba(255, 255, 255, 0.94) !important;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
+  color: var(--dt-text-primary) !important;
+  font-size: 20px !important;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.dt-map-zoom-control button:hover {
+  background: rgba(255, 255, 255, 1) !important;
+}
+
+.dt-map-scale-control {
+  position: absolute;
+  bottom: 38px;
+  left: 12px;
+  z-index: 40;
+  border-radius: 5px;
+  background: rgba(15, 23, 42, 0.78);
+  padding: 3px 5px;
+}
+
+.dt-map-scale-control-inner {
+  margin: 1px;
+  border: 1px solid rgba(255, 255, 255, 0.94);
+  border-top: 0;
+  color: white;
+  font-size: 10px;
+  line-height: 1.1;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* PRIWA field layout (phones, tablets, touch): the map keeps the corners free
+   for the flight bar (bottom left) and the primary actions (bottom right). */
+.priwa-field-map {
+  /* Aligned with the primary actions on the right; the attribution no longer
+     sits under the flight bar, so the corner needs only the safe-area inset. */
+  --priwa-flight-bar-bottom: max(20px, calc(env(safe-area-inset-bottom, 0px) + 20px));
+  --priwa-map-controls-top: calc(env(safe-area-inset-top, 0px) + 5rem);
+}
+
+.priwa-field-map[data-priwa-layout="field"] .dt-map-zoom-control {
+  display: flex !important;
+  top: var(--priwa-map-controls-top) !important;
+  bottom: auto !important;
+  right: 16px !important;
+  left: auto !important;
+}
+
+.priwa-field-map[data-priwa-layout="field"] .dt-map-scale-control {
+  bottom: calc(var(--priwa-flight-bar-bottom) + 64px);
+  left: 16px;
+}
+
+/* Keep legend above the scale and flight selector, including tablet landscape. */
+.priwa-field-map[data-priwa-layout="field"] .priwa-warnkarte-legend {
+  bottom: calc(var(--priwa-flight-bar-bottom) + 96px);
+  left: 16px;
+  transform: none;
+  width: min(19rem, calc(100% - 6rem));
+}
+
+.priwa-field-map[data-priwa-flight-panel-placement="side"] .priwa-warnkarte-legend {
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 70px);
+  left: 22.5rem;
+  width: min(19rem, calc(100% - 24rem));
+}
+
+.priwa-field-map[data-priwa-flight-panel-placement="side"] .dt-map-scale-control {
+  bottom: 38px;
+  left: 22.5rem;
+}
+
+.priwa-field-map[data-priwa-flight-panel-placement="side"] .dt-map-attribution-control {
+  left: 22.5rem;
+}
+
+/* PRIWA desktop review workbench: controls sit beside the queue panel. */
+.priwa-field-map[data-priwa-layout="desktop"] .dt-map-zoom-control {
+  bottom: 92px !important;
+  left: 368px !important;
+  right: auto !important;
+  flex-direction: row;
+}
+
+.priwa-field-map[data-priwa-layout="desktop"] .dt-map-scale-control {
+  bottom: 100px;
+  left: 456px;
+}
+
+.dt-map-attribution-control button {
+  display: none;
+}
+
+/* Field maps collapse the attribution to a small info button in the right-hand
+   control column, right below the zoom buttons, so the bottom-left corner stays
+   free for the flight selector. A tap expands the source text leftwards. */
+.priwa-field-map .dt-map-attribution-control {
+  display: inline-flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  padding: 0;
+  border-radius: 8px;
+  white-space: normal;
+}
+
+.priwa-field-map[data-priwa-layout="field"] .dt-map-attribution-control {
+  top: calc(var(--priwa-map-controls-top) + 92px);
+  bottom: auto;
+  right: 16px;
+  left: auto;
+  max-width: calc(100% - 32px);
+  background-color: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
+}
+
+.priwa-field-map .dt-map-attribution-control:not(.ol-collapsed) {
+  padding-left: 8px;
+}
+
+/* The expanded source disclosure must remain readable above the flight sheet.
+   OpenLayers sets an inline z-index of 0 on its control container, which would
+   trap the control in that stacking context; !important beats the inline style. */
+.priwa-field-map .ol-overlaycontainer-stopevent {
+  z-index: auto !important;
+}
+
+.priwa-field-map[data-priwa-flight-panel-placement="sheet"]
+  .dt-map-attribution-control:not(.ol-collapsed) {
+  z-index: 1001;
+}
+
+.priwa-field-map .dt-map-attribution-control:not(.ol-collapsed) ul {
+  display: block;
+  padding-right: 2px;
+  text-align: right;
+}
+
+.priwa-field-map .dt-map-attribution-control button,
+.priwa-field-map .dt-map-attribution-control button:hover,
+.priwa-field-map .dt-map-attribution-control button:focus {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 8px;
+  outline: none;
+  background: transparent;
+  color: #334155;
+  cursor: pointer;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.priwa-field-map .dt-map-attribution-control button:focus-visible {
+  outline: 2px solid #059669;
+  outline-offset: -2px;
+}
+
+.priwa-field-map .dt-map-attribution-control:not(.ol-collapsed) button {
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 400;
+}
+
+.dt-map-attribution-control ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dt-map-attribution-control li {
+  display: inline;
+  margin: 0;
+}
+
+.dt-attribution-mobile {
+  display: none;
+}
+
+.dt-attribution-mobile summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.dt-attribution-mobile summary::-webkit-details-marker {
+  display: none;
+}
+
+.dt-attribution-mobile-full {
+  display: block;
+  padding-top: 2px;
+  white-space: normal;
+}
+
+@media (max-width: 359px) {
+  .dt-map-attribution-control {
+    white-space: normal;
+  }
+}
+
+/* The medium desktop map has a centered year/history controller. Lift only
+   this map's attribution above it; wide layouts have enough horizontal room
+   to use the conventional bottom-left position. */
+@media (min-width: 768px) and (max-width: 1439px) {
+  .dt-deadtrees-map .dt-map-attribution-control {
+    bottom: 112px;
+  }
+}
+
+@media (max-width: 767px) {
+  .dt-map-zoom-control {
+    display: none !important;
+  }
+
+  .dt-map-attribution-control {
+    bottom: 8px;
+    left: 8px;
+    max-width: calc(100% - 16px);
+    padding: 2px 5px;
+    font-size: 9px;
+    line-height: 1.2;
+  }
+
+  .dt-deadtrees-map .dt-map-attribution-control {
+    bottom: 64px;
+    right: auto;
+    left: 8px;
+  }
+
+  .dt-attribution-full {
+    display: none;
+  }
+
+  .dt-attribution-mobile {
+    display: inline-block;
+  }
+
+  .dt-mobile-navigation-drawer-root .ant-drawer-content,
+  .dt-mobile-navigation-drawer-root .ant-drawer-content-wrapper,
+  .priwa-point-drawer-root .ant-drawer-content,
+  .priwa-point-drawer-root .ant-drawer-content-wrapper {
+    max-height: 100dvh;
+  }
+
+  .dt-mobile-navigation-drawer-root .ant-drawer-header {
+    padding-top: calc(env(safe-area-inset-top, 0px) + 16px);
+  }
+
+  .dt-mobile-navigation-drawer-root .ant-drawer-body {
+    padding-bottom: env(safe-area-inset-bottom, 0px) !important;
+  }
+
+  .dt-mobile-navigation-drawer-footer {
+    padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 16px) !important;
+  }
+}
+
+.priwa-point-drawer-root .ant-drawer-body {
+  min-height: 0;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+
+.priwa-point-drawer-root .ant-drawer-content,
+.priwa-point-drawer-root .ant-drawer-content-wrapper {
+  max-height: 100dvh;
+}
+
+.priwa-layer-sheet-root .ant-drawer-content {
+  border-radius: 16px 16px 0 0;
+  overflow: hidden;
+}
+
+.priwa-layer-sheet-root .ant-drawer-body {
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.logo-scroll {
+  overflow: hidden;
+  width: 100%;
+  position: relative;
+}
+
+.logo-container {
+  display: flex;
+  animation: scroll 30s linear infinite;
+  width: fit-content;
+}
+
+.logo-item {
+  flex: 0 0 auto;
+  width: 200px;
+  margin: 0 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+@keyframes scroll {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+/* Optional: Pause on hover */
+.logo-container:hover {
+  animation-play-state: paused;
+}
+
+/* Release gallery: force scrollbars to be always visible so the
+ * 2-axis scroll (datasets vertically, patches horizontally) is discoverable
+ * even on macOS where overlay scrollbars hide by default. */
+.release-gallery-scroll {
+  scrollbar-gutter: stable;
+  scrollbar-color: rgba(27, 94, 53, 0.45) rgba(207, 216, 210, 0.6);
+  scrollbar-width: thin;
+}
+
+.release-gallery-scroll::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+  background-color: rgba(207, 216, 210, 0.6);
+}
+
+.release-gallery-scroll::-webkit-scrollbar-track {
+  background-color: rgba(207, 216, 210, 0.6);
+}
+
+.release-gallery-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(27, 94, 53, 0.45);
+  border: 2px solid rgba(207, 216, 210, 0.6);
+  border-radius: 999px;
+}
+
+.release-gallery-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(27, 94, 53, 0.7);
+}
+
+.release-gallery-scroll::-webkit-scrollbar-corner {
+  background-color: rgba(207, 216, 210, 0.6);
+}
+
+/* Improve checkbox visibility across the app (especially on white cards/modals). */
+.ant-checkbox .ant-checkbox-inner {
+  border-color: #6b7280;
+  border-width: 1.5px;
+  background-color: #ffffff;
+}
+
+.ant-checkbox-wrapper:hover .ant-checkbox-inner,
+.ant-checkbox:hover .ant-checkbox-inner {
+  border-color: #1b5e35;
+}
+
+.ant-checkbox-checked .ant-checkbox-inner {
+  border-color: #1b5e35;
+  background-color: #1b5e35;
+}
+
+.ant-checkbox-input:focus-visible + .ant-checkbox-inner {
+  outline: 2px solid rgba(27, 94, 53, 0.28);
+  outline-offset: 2px;
+}
+
+.ant-checkbox-disabled .ant-checkbox-inner {
+  border-color: #94a3b8 !important;
+}
+
+@media (max-width: 767px) {
+  .map-controls-mobile-drawer .ant-drawer-content-wrapper {
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    top: auto !important;
+    width: auto !important;
+    max-width: 100% !important;
+    height: auto !important;
+    max-height: 100dvh !important;
+    box-sizing: border-box;
+    overflow-x: clip !important;
+  }
+
+  .map-controls-mobile-drawer .ant-drawer-content {
+    width: 100%;
+    max-height: 100dvh;
+    box-sizing: border-box;
+    overflow-x: clip !important;
+  }
+
+  .map-controls-mobile-drawer .ant-drawer-body {
+    height: auto;
+    max-height: calc(100dvh - 56px);
+    box-sizing: border-box;
+    overflow-x: clip !important;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .map-controls-mobile-drawer .ant-drawer-body::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
+  }
+
+  .map-control-panel--drawer .ant-divider {
+    margin-top: 10px;
+    margin-bottom: 10px;
+  }
+
+  .map-control-panel--drawer .ant-checkbox-wrapper + .ant-checkbox-wrapper {
+    margin-top: 6px;
+  }
+
+  .map-control-panel--drawer .ant-slider {
+    margin-top: 6px;
+    margin-bottom: 6px;
+  }
+
+  .ant-input,
+  .ant-input-affix-wrapper,
+  .ant-input-affix-wrapper input,
+  .ant-input-textarea textarea,
+  textarea.ant-input {
+    font-size: 16px !important;
+  }
+
+  .priwa-point-drawer-root .ant-input,
+  .priwa-point-drawer-root .ant-input-affix-wrapper,
+  .priwa-point-drawer-root .ant-input-affix-wrapper input,
+  .priwa-point-drawer-root .ant-input-textarea textarea,
+  .priwa-point-drawer-root textarea.ant-input,
+  .priwa-point-drawer-root .ant-select-selector,
+  .priwa-point-drawer-root .ant-select-selection-item,
+  .priwa-point-drawer-root .ant-select-selection-placeholder,
+  .priwa-point-drawer-root .ant-select-selection-search-input {
+    font-size: 16px !important;
+  }
+}
+
+.priwa-comment-form-item.ant-form-item {
+  margin-bottom: 30px !important;
+}
+
+.priwa-point-table-row-focused > td,
+.priwa-point-table-row-focused:hover > td {
+  background: #ecfdf5 !important;
+}
+
+.priwa-point-table-row-focused > td:first-child {
+  box-shadow: inset 3px 0 #059669;
+}
+
+/* Contributor status tags keep Ant Design's preset backgrounds but use darker
+   semantic foregrounds so 12px text stays readable (>= 4.5:1). */
+.dt-status-tag.ant-tag-warning {
+  color: #8a4b00;
+}
+
+.dt-status-tag.ant-tag-success {
+  color: #1f6b3a;
+}
+
+.dt-status-tag.ant-tag-processing {
+  color: #1d4ed8;
+}
+
+.dt-status-tag.ant-tag-error {
+  color: #b42318;
+}
+
+.dt-status-tag.ant-tag-default {
+  color: #475569;
+}
+
+/* Opaque band behind the floating header pill so scrolled page content never
+   shows in, or receives clicks through, the gutters around it. */
+.dt-nav-shell {
+  background: #f8faf9;
+}
+
+.dt-mobile-nav-shell {
+  padding-top: calc(env(safe-area-inset-top, 0px) + 0.5rem);
+}
+
+.priwa-map-control-stack,
+.priwa-map-status-stack,
+.priwa-flight-side-panel {
+  top: var(--priwa-map-controls-top);
+}
+
+.priwa-field-map[data-priwa-layout="field"] .priwa-map-status-stack {
+  right: 4.5rem;
+}
+
+.priwa-warnkarte-tooltip {
+  pointer-events: none;
+  border: 1px solid rgb(226 232 240 / 85%);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 96%);
+  box-shadow: 0 6px 20px rgb(15 23 42 / 18%);
+  color: rgb(15 23 42);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+
+@media (min-width: 1024px) {
+  .priwa-field-map {
+    --priwa-map-controls-top: 6rem;
+  }
+}
+
+/* Map gutters remain visible and interactive; the branded pill owns clicks. */
+.dt-nav-shell[data-map-backdrop] {
+  background: transparent;
+  pointer-events: none;
+}
+
+/* One archive search field; the mode menu and submit button live inside it. */
+.dt-archive-search {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px 4px 4px 10px;
+  border: 1px solid #d9e2dc;
+  border-radius: 12px;
+  background: white;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.dt-archive-search:focus-within {
+  border-color: #39724b;
+  box-shadow: 0 0 0 3px rgb(57 114 75 / 12%);
+}
+.dt-archive-search-icon {
+  flex-shrink: 0;
+  color: #6b7280;
+  font-size: 14px;
+}
+.dt-archive-search > .ant-input-affix-wrapper {
+  min-width: 0;
+  flex: 1;
+  padding-left: 6px;
+}
+.dt-archive-search > button,
+.dt-archive-search .dt-archive-search-mode {
+  flex-shrink: 0;
+}
+.dt-archive-search .dt-archive-search-mode {
+  color: #4b5563;
+  font-size: 12px;
+  border-radius: 8px;
+  background: #f3f6f4;
+}
+.dt-archive-search .dt-archive-search-mode .anticon-down {
+  font-size: 10px;
+}
+
+/* Skeletons stop shimmering for visitors who ask for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  .ant-skeleton.ant-skeleton-active * {
+    animation: none !important;
+  }
+}

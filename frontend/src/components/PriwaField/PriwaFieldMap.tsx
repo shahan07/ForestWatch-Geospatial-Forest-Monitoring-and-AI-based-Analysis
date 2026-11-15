@@ -1,0 +1,1243 @@
+import { Alert, App, Button, Tooltip } from "antd";
+import {
+  AimOutlined,
+  EnvironmentOutlined,
+  PlusOutlined,
+} from "@ant-design/icons";
+import "ol/ol.css";
+import { Map } from "ol";
+import { defaults as defaultInteractions } from "ol/interaction";
+import { unByKey } from "ol/Observable";
+import { fromLonLat, toLonLat, transformExtent } from "ol/proj";
+import View from "ol/View";
+import { boundingExtent } from "ol/extent";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { PointerEvent, ReactNode } from "react";
+
+import { createStandardMapControls } from "../../utils/basemaps";
+import parseBBox from "../../utils/parseBBox";
+import { useIsMobile } from "../../hooks/useIsMobile";
+import { useUserLocationLayer } from "../../hooks/useUserLocationLayer";
+import { createLglDop20Layer } from "./createLglDop20Layer";
+import { PRIWA_COG_MAX_ZOOM } from "./createPriwaCogLayer";
+import { createPriwaTopographicLayer } from "./createPriwaTopographicLayer";
+import { createPriwaOfflineAreaLayer } from "./createPriwaOfflineAreaLayer";
+import { createPriwaMosaicFootprintLayer } from "./createPriwaMosaicFootprintLayer";
+import {
+  createPriwaPointFeature,
+  createPriwaPointLayer,
+  createPriwaPreviewFeature,
+  createPriwaPreviewLayer,
+} from "./createPriwaPointLayer";
+import { createPriwaBefallsgruppeLayer } from "./createPriwaBefallsgruppeLayer";
+import {
+  createPriwaWarnkarteLayer,
+  fitPriwaWarnkarteLayer,
+  setPriwaWarnkarteLayerData,
+} from "./createPriwaWarnkarteLayer";
+import { PriwaWarnkarteZoomControl } from "./PriwaWarnkarteMapControls";
+import { attachPriwaWarnkarteInteraction } from "./priwaWarnkarteMapInteraction";
+import PriwaPointDrawer from "./PriwaPointDrawer";
+import PriwaPointListPanel from "./PriwaPointListPanel";
+import PriwaOfflineStatus from "./PriwaOfflineStatus";
+import PriwaBefallsgruppeEditor from "./PriwaBefallsgruppeEditor";
+import PriwaBaseLayerControl from "./PriwaBaseLayerControl";
+import PriwaMobileFieldTools from "./PriwaMobileFieldTools";
+import PriwaMobilePrimaryActions from "./PriwaMobilePrimaryActions";
+import PriwaOfflineAreaSelection from "./PriwaOfflineAreaSelection";
+import PriwaOfflineMapPanel from "./PriwaOfflineMapPanel";
+import PriwaWarnkarteMapUi from "./PriwaWarnkarteMapUi";
+import PriwaReviewWorkbench, {
+  type PriwaReviewDetailMode,
+} from "./PriwaReviewWorkbench";
+import PriwaFieldFlightUi from "./PriwaFieldFlightUi";
+import {
+  getPriwaMapFitPadding,
+  getPriwaReviewMapCenter,
+  getPriwaReviewTargetPixel,
+} from "./priwaReviewMapFocus";
+import { usePriwaFieldFlights } from "./usePriwaFieldFlights";
+import { usePriwaFieldLayout } from "./usePriwaFieldLayout";
+import { usePriwaOfflineMosaics } from "./usePriwaOfflineMosaics";
+import { usePriwaOfflineStatus } from "./usePriwaOfflineStatus";
+import { usePriwaOfflineBasemap } from "./usePriwaOfflineBasemap";
+import { usePriwaOfflineAreaLayer } from "./usePriwaOfflineAreaLayer";
+import {
+  calculatePriwaOfflineCoverageRatio,
+  type PriwaMapExtent,
+} from "./priwaOfflineCoverage";
+import {
+  usePriwaOfflineSelectionPlan,
+  type IPriwaOfflineSelectionPlan,
+} from "./usePriwaOfflineSelectionPlan";
+import { usePriwaMapInteractionMode } from "./usePriwaMapInteractionMode";
+import { usePriwaReviewController } from "./usePriwaReviewController";
+import { usePriwaReviewMapLayers } from "./usePriwaReviewMapLayers";
+import type { IPriwaMosaic, PriwaFlightType } from "./usePriwaMosaics";
+import type { IPriwaSyncSummary } from "./priwaOfflineSync";
+import type { IPriwaWarnkarteOverlay } from "../../api/priwaWarnkarte";
+import type {
+  IPriwaBefallsgruppe,
+  IPriwaBefallsgruppeSaveInput,
+  PriwaBaseLayer,
+  IPriwaCoordinate,
+  IPriwaPoint,
+  PriwaCoordinateSource,
+} from "./types";
+
+const FIELD_CENTER: [number, number] = [8.18013, 48.45596];
+
+interface PriwaFieldMapProps {
+  points: IPriwaPoint[];
+  projectId: string;
+  isLoadingPoints?: boolean;
+  isSavingPoint?: boolean;
+  projectName: string;
+  warnkarteOverlay: IPriwaWarnkarteOverlay | null;
+  warnkarteVisible: boolean;
+  warnkarteLoading: boolean;
+  onWarnkarteVisibilityChange: (visible: boolean) => void;
+  additionalMapControl?: ReactNode;
+  reviewDetailMode?: PriwaReviewDetailMode;
+  mosaics?: IPriwaMosaic[];
+  groups?: IPriwaBefallsgruppe[];
+  isCogLoading?: boolean;
+  isLoadingGroups?: boolean;
+  isSavingGroup?: boolean;
+  groupsErrorMessage?: string | null;
+  cogErrorMessage?: string | null;
+  errorMessage?: string | null;
+  syncSummary?: IPriwaSyncSummary;
+  onAddPoint: (point: IPriwaPoint) => Promise<void>;
+  onUpdatePoint: (point: IPriwaPoint) => Promise<void>;
+  onDeletePoint: (pointId: string) => Promise<void>;
+  onSaveGroup: (input: IPriwaBefallsgruppeSaveInput) => Promise<unknown>;
+  onAssignFlightToGroup: (input: {
+    groupId: string;
+    datasetId: string;
+  }) => Promise<unknown>;
+  onDeleteGroup: (groupId: string) => Promise<unknown>;
+  onSetFlightType: (input: {
+    datasetId: string;
+    flightType: PriwaFlightType;
+  }) => Promise<unknown>;
+  isClassifyingFlight?: boolean;
+  onSyncNow?: () => Promise<void>;
+}
+
+type PriwaMapPanel = "layers" | "offline" | "trees" | "flights";
+
+export default function PriwaFieldMap({
+  points,
+  projectId,
+  isLoadingPoints = false,
+  isSavingPoint = false,
+  projectName,
+  warnkarteOverlay,
+  warnkarteVisible,
+  warnkarteLoading,
+  onWarnkarteVisibilityChange,
+  additionalMapControl,
+  reviewDetailMode,
+  mosaics: onlineMosaics = [],
+  groups = [],
+  isCogLoading = false,
+  isLoadingGroups = false,
+  isSavingGroup = false,
+  groupsErrorMessage = null,
+  cogErrorMessage = null,
+  errorMessage = null,
+  syncSummary,
+  onAddPoint,
+  onUpdatePoint,
+  onDeletePoint,
+  onSaveGroup,
+  onAssignFlightToGroup,
+  onDeleteGroup,
+  onSetFlightType,
+  isClassifyingFlight = false,
+  onSyncNow,
+}: PriwaFieldMapProps) {
+  const { message } = App.useApp();
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<Map | null>(null);
+  const hasRequestedOrientationFromInteractionRef = useRef(false);
+  const hasFittedInitialMobilePointsRef = useRef(false);
+  const pointLayerRef = useRef<ReturnType<typeof createPriwaPointLayer> | null>(
+    null,
+  );
+  const groupLayerRef = useRef<ReturnType<
+    typeof createPriwaBefallsgruppeLayer
+  > | null>(null);
+  const warnkarteLayerRef = useRef<ReturnType<
+    typeof createPriwaWarnkarteLayer
+  > | null>(null);
+  const previewLayerRef = useRef<ReturnType<
+    typeof createPriwaPreviewLayer
+  > | null>(null);
+  const offlineAreaLayerRef = useRef<ReturnType<
+    typeof createPriwaOfflineAreaLayer
+  > | null>(null);
+  const aerialLayerRef = useRef<ReturnType<typeof createLglDop20Layer> | null>(
+    null,
+  );
+  const topographicLayerRef = useRef<ReturnType<
+    typeof createPriwaTopographicLayer
+  > | null>(null);
+  const mosaicFootprintLayerRef = useRef<ReturnType<
+    typeof createPriwaMosaicFootprintLayer
+  > | null>(null);
+  const selectReviewItemFromMosaicRef = useRef<(mosaicId: string) => void>(
+    () => undefined,
+  );
+  const selectReviewItemFromGroupRef = useRef<(groupId: string) => void>(
+    () => undefined,
+  );
+  const selectReviewItemFromPointRef = useRef<(point: IPriwaPoint) => void>(
+    () => undefined,
+  );
+  const selectFlightFromMapRef = useRef<(mosaicId: string) => void>(
+    () => undefined,
+  );
+  const openPointForEditingRef = useRef<(point: IPriwaPoint) => void>(() => {
+    return;
+  });
+  const [isDrawerOpen, setDrawerOpen] = useState(false);
+  const [selectedCoordinate, setSelectedCoordinate] =
+    useState<IPriwaCoordinate | null>(null);
+  const [selectedCoordinateSource, setSelectedCoordinateSource] =
+    useState<PriwaCoordinateSource>("qr");
+  const [editingPoint, setEditingPoint] = useState<IPriwaPoint | null>(null);
+  const [formSessionId, setFormSessionId] = useState(0);
+  const [isPointListOpen, setPointListOpen] = useState(false);
+  const [focusedPointId, setFocusedPointId] = useState<string | null>(null);
+  const [reviewPointId, setReviewPointId] = useState<string | null>(null);
+  const [baseLayer, setBaseLayer] = useState<PriwaBaseLayer>("aerial");
+  const [activeMapPanel, setActiveMapPanel] = useState<PriwaMapPanel | null>(
+    null,
+  );
+  const [viewportExtent3857, setViewportExtent3857] =
+    useState<PriwaMapExtent | null>(null);
+  const mapInteraction = usePriwaMapInteractionMode();
+  const { modeRef, setMode } = mapInteraction;
+  const isMobile = useIsMobile("lg");
+  const { isFieldLayout, flightPanelPlacement } = usePriwaFieldLayout();
+  const isFieldLayoutRef = useRef(isFieldLayout);
+  const { isOnline } = usePriwaOfflineStatus();
+  const offlineMosaics = usePriwaOfflineMosaics(projectId, onlineMosaics);
+  const { mosaics } = offlineMosaics;
+  const userLocation = useUserLocationLayer(mapRef);
+  const {
+    layer: userLocationLayer,
+    locateUser,
+    stop: stopUserLocation,
+  } = userLocation;
+  const {
+    areas: offlineBasemapAreas,
+    readyAreas: readyOfflineBasemapAreas,
+    needsRefresh: offlineBasemapNeedsRefresh,
+    isCacheAuditComplete: isOfflineBasemapCacheAuditComplete,
+    cacheState: basemapCacheState,
+    cacheCurrentMapArea,
+    clearAreas: clearOfflineBasemapAreas,
+    refreshAreas: refreshOfflineBasemapAreas,
+    isSupported: isOfflineBasemapSupported,
+  } = usePriwaOfflineBasemap(projectId);
+  const offlineSelectionPlan = usePriwaOfflineSelectionPlan(
+    mapRef,
+    mapInteraction.isSelectingOfflineArea,
+  );
+  const isOfflineMapModeActive = activeMapPanel === "offline";
+  const isMapLayersOpen = activeMapPanel === "layers";
+  const isTreeListOpen = activeMapPanel === "trees";
+  const isFlightPanelOpen = activeMapPanel === "flights";
+  const isFlightSidePanelOpen =
+    isFlightPanelOpen && flightPanelPlacement === "side";
+
+  useEffect(() => {
+    isFieldLayoutRef.current = isFieldLayout;
+  }, [isFieldLayout]);
+  usePriwaOfflineAreaLayer(
+    offlineAreaLayerRef,
+    offlineBasemapAreas,
+    isOfflineMapModeActive || mapInteraction.isSelectingOfflineArea,
+  );
+  const offlineViewportCoverageRatio = calculatePriwaOfflineCoverageRatio(
+    viewportExtent3857,
+    readyOfflineBasemapAreas.map((area) => area.extent3857),
+  );
+
+  const zoomToTrees = useCallback(
+    (treeIds: string[]) => {
+      const coordinates = points
+        .filter((point) => treeIds.includes(point.id))
+        .map((point) => fromLonLat([point.lon, point.lat]));
+      const view = mapRef.current?.getView();
+      if (!view || coordinates.length === 0) return;
+      if (coordinates.length === 1) {
+        view.animate({ center: coordinates[0], zoom: 20, duration: 500 });
+        return;
+      }
+      view.fit(boundingExtent(coordinates), {
+        duration: 500,
+        maxZoom: 20,
+        padding: [120, 120, 120, 120],
+      });
+    },
+    [points],
+  );
+
+  const zoomToMosaicFootprint = useCallback(
+    (mosaic: IPriwaMosaic) => {
+      if (!mosaic.bbox) {
+        message.warning(
+          "Für diesen Drohnenlayer ist keine Kartengrenze verfügbar.",
+        );
+        return;
+      }
+
+      const bbox = parseBBox(mosaic.bbox);
+      if (!bbox) {
+        message.warning("Kartengrenze konnte nicht gelesen werden.");
+        return;
+      }
+
+      const map = mapRef.current;
+      if (!map) return;
+      map.getView().fit(transformExtent(bbox, "EPSG:4326", "EPSG:3857"), {
+        duration: 500,
+        maxZoom: 19,
+        padding: getPriwaMapFitPadding(
+          map.getTargetElement()!,
+          isFieldLayoutRef.current,
+        ),
+      });
+    },
+    [message],
+  );
+
+  const review = usePriwaReviewController({
+    projectId,
+    points,
+    mosaics,
+    groups,
+    isMobile: isFieldLayout,
+    isLoadingPoints,
+    isLoadingGroups,
+    isCogLoading,
+    groupsErrorMessage,
+    onSaveGroup,
+    onDeleteGroup,
+    onSetFlightType,
+    onAssignFlightToGroup,
+    zoomToTrees,
+    zoomToMosaicFootprint,
+  });
+  const {
+    matchedMosaics,
+    reviewMosaics,
+    enabledMosaics,
+    enabledMosaicIds,
+    selectedMosaicId,
+    setSelectedMosaicId,
+    selectMatchedMosaicForPoint,
+    showOnlyMosaics,
+    setFlightType,
+    reviewItems,
+    selectedReviewKey,
+    selectedTreeIds,
+    selectedGroupId,
+    isWorkspaceLoading,
+    groupEditorDraft,
+    setGroupEditorDraft,
+    selectReviewItem,
+    selectReviewItemFromMosaic,
+    selectReviewItemFromGroup,
+    selectReviewItemFromPoint,
+    saveGroup,
+    deleteGroup,
+    assignFlight,
+    setMosaicVisibility,
+    createGroup,
+    createGroupForFlight,
+  } = review;
+  const openPointForEditing = useCallback(
+    (point: IPriwaPoint) => {
+      selectMatchedMosaicForPoint(point);
+      setPointListOpen(false);
+      setFormSessionId((currentSessionId) => currentSessionId + 1);
+      setEditingPoint(point);
+      setSelectedCoordinate({ lat: point.lat, lon: point.lon });
+      setSelectedCoordinateSource(point.coordinateSource);
+      setDrawerOpen(true);
+    },
+    [selectMatchedMosaicForPoint],
+  );
+
+  useEffect(() => {
+    openPointForEditingRef.current = openPointForEditing;
+  }, [openPointForEditing]);
+
+  useEffect(() => {
+    if (!containerRef.current || mapRef.current) return;
+
+    const topographicLayer = createPriwaTopographicLayer();
+    const dopLayer = createLglDop20Layer();
+    const offlineAreaLayer = createPriwaOfflineAreaLayer();
+    const mosaicFootprintLayer = createPriwaMosaicFootprintLayer();
+    const warnkarteLayer = createPriwaWarnkarteLayer();
+    const groupLayer = createPriwaBefallsgruppeLayer();
+    const pointLayer = createPriwaPointLayer([]);
+    const previewLayer = createPriwaPreviewLayer();
+    aerialLayerRef.current = dopLayer;
+    topographicLayerRef.current = topographicLayer;
+    offlineAreaLayerRef.current = offlineAreaLayer;
+    mosaicFootprintLayerRef.current = mosaicFootprintLayer;
+    warnkarteLayerRef.current = warnkarteLayer;
+    groupLayerRef.current = groupLayer;
+    pointLayerRef.current = pointLayer;
+    previewLayerRef.current = previewLayer;
+
+    const map = new Map({
+      target: containerRef.current,
+      layers: [
+        topographicLayer,
+        dopLayer,
+        offlineAreaLayer,
+        warnkarteLayer,
+        mosaicFootprintLayer,
+        groupLayer,
+        pointLayer,
+        previewLayer,
+        userLocationLayer,
+      ],
+      view: new View({
+        center: fromLonLat(FIELD_CENTER),
+        zoom: 19,
+        minZoom: 8,
+        maxZoom: PRIWA_COG_MAX_ZOOM,
+        projection: "EPSG:3857",
+      }),
+      interactions: defaultInteractions({
+        pinchRotate: false,
+        altShiftDragRotate: false,
+      }),
+      controls: createStandardMapControls({
+        collapsibleAttribution: true,
+        includeZoom: true,
+        includeAttribution: true,
+        includeScaleLine: true,
+      }),
+    });
+
+    mapRef.current = map;
+    const updateViewportExtent = () => {
+      const size = map.getSize();
+      if (!size) return;
+      setViewportExtent3857(
+        map.getView().calculateExtent(size) as PriwaMapExtent,
+      );
+    };
+    updateViewportExtent();
+    const moveEndKey = map.on("moveend", updateViewportExtent);
+    const sizeChangeKey = map.on("change:size", updateViewportExtent);
+    const detachWarnkarteInteraction = attachPriwaWarnkarteInteraction(
+      map,
+      warnkarteLayer,
+      () => modeRef.current === "browse",
+    );
+
+    const clickKey = map.on("singleclick", (event) => {
+      if (modeRef.current !== "browse") return;
+
+      const pointFeature = map.forEachFeatureAtPixel(
+        event.pixel,
+        (feature) => {
+          const point = feature.get("point") as IPriwaPoint | undefined;
+          return point ?? null;
+        },
+        {
+          hitTolerance: 18,
+          layerFilter: (layer) => layer === pointLayerRef.current,
+        },
+      );
+
+      if (pointFeature) {
+        if (isFieldLayoutRef.current) {
+          openPointForEditingRef.current(pointFeature);
+        } else {
+          selectReviewItemFromPointRef.current(pointFeature);
+        }
+        return;
+      }
+
+      const groupId = map.forEachFeatureAtPixel(
+        event.pixel,
+        (feature) => {
+          const id = feature.get("groupId") as string | undefined;
+          return id ?? null;
+        },
+        {
+          hitTolerance: 12,
+          layerFilter: (layer) => layer === groupLayerRef.current,
+        },
+      );
+
+      if (groupId) {
+        selectReviewItemFromGroupRef.current(groupId);
+        return;
+      }
+
+      const mosaicId = map.forEachFeatureAtPixel(
+        event.pixel,
+        (feature) => {
+          const id = feature.get("mosaicId") as string | undefined;
+          return id ?? null;
+        },
+        {
+          hitTolerance: 12,
+          layerFilter: (layer) => layer === mosaicFootprintLayerRef.current,
+        },
+      );
+
+      if (mosaicId) {
+        if (isFieldLayoutRef.current) {
+          selectFlightFromMapRef.current(mosaicId);
+        } else {
+          selectReviewItemFromMosaicRef.current(mosaicId);
+        }
+        return;
+      }
+    });
+
+    return () => {
+      stopUserLocation();
+      detachWarnkarteInteraction();
+      unByKey([clickKey, moveEndKey, sizeChangeKey]);
+      map.setTarget(undefined);
+      mapRef.current = null;
+      offlineAreaLayerRef.current = null;
+      aerialLayerRef.current = null;
+      topographicLayerRef.current = null;
+      mosaicFootprintLayerRef.current = null;
+      warnkarteLayerRef.current = null;
+      groupLayerRef.current = null;
+      pointLayerRef.current = null;
+      previewLayerRef.current = null;
+    };
+  }, [modeRef, stopUserLocation, userLocationLayer]);
+
+  useEffect(() => {
+    if (!warnkarteLayerRef.current) return;
+    setPriwaWarnkarteLayerData(warnkarteLayerRef.current, warnkarteOverlay);
+  }, [warnkarteOverlay]);
+
+  useEffect(() => {
+    warnkarteLayerRef.current?.setVisible(warnkarteVisible);
+  }, [warnkarteVisible]);
+
+  useEffect(() => {
+    aerialLayerRef.current?.setVisible(baseLayer === "aerial");
+    topographicLayerRef.current?.setVisible(baseLayer === "topographic");
+  }, [baseLayer]);
+
+  useEffect(() => {
+    const source = pointLayerRef.current?.getSource();
+    if (!source) return;
+
+    source.clear();
+    points.forEach((point) =>
+      source.addFeature(
+        createPriwaPointFeature(
+          point,
+          selectedTreeIds.has(point.id),
+          point.id === reviewPointId,
+        ),
+      ),
+    );
+  }, [points, reviewPointId, selectedTreeIds]);
+
+  // Field layout: no group outlines, but the selected orthomosaics render at full
+  // native resolution just like on the desktop workbench.
+  usePriwaReviewMapLayers({
+    mapRef,
+    groupLayerRef,
+    mosaicFootprintLayerRef,
+    groups: isFieldLayout ? [] : groups,
+    points,
+    matchedMosaics,
+    reviewMosaics,
+    enabledMosaics,
+    enabledMosaicIds,
+    selectedMosaicId,
+    selectedGroupId: isFieldLayout ? null : selectedGroupId,
+  });
+
+  // A remembered flight defines the first view of a field session; the trees
+  // only frame the map when no flight comes back.
+  const fitRestoredFlight = useCallback(
+    (mosaic: IPriwaMosaic) => {
+      hasFittedInitialMobilePointsRef.current = true;
+      zoomToMosaicFootprint(mosaic);
+    },
+    [zoomToMosaicFootprint],
+  );
+  const fieldFlights = usePriwaFieldFlights({
+    projectId,
+    enabled: isFieldLayout,
+    mosaics,
+    matchedMosaics,
+    reviewMosaics,
+    enabledMosaicIds,
+    selectedMosaicId,
+    showOnlyMosaics,
+    setSelectedMosaicId,
+    setMosaicVisibility,
+    offlineEntries: offlineMosaics.entries,
+    isOnline,
+    isLoading: (isOnline && isCogLoading) || offlineMosaics.isLoading,
+    onRestore: fitRestoredFlight,
+  });
+  const { showFlight, isAwaitingRestore } = fieldFlights;
+
+  useEffect(() => {
+    if (
+      !isFieldLayout ||
+      isAwaitingRestore ||
+      hasFittedInitialMobilePointsRef.current ||
+      points.length === 0 ||
+      !mapRef.current
+    ) {
+      return;
+    }
+
+    const coordinates = points.map((point) =>
+      fromLonLat([point.lon, point.lat]),
+    );
+    mapRef.current.getView().fit(boundingExtent(coordinates), {
+      duration: 500,
+      maxZoom: 19,
+      padding: [150, 48, 130, 48],
+    });
+    hasFittedInitialMobilePointsRef.current = true;
+  }, [isAwaitingRestore, isFieldLayout, points]);
+  const fitToFlight = useCallback(
+    (mosaicId: string) => {
+      const mosaic = mosaics.find((candidate) => candidate.id === mosaicId);
+      if (mosaic) zoomToMosaicFootprint(mosaic);
+    },
+    [mosaics, zoomToMosaicFootprint],
+  );
+  const toggleFlightPanel = useCallback(() => {
+    setActiveMapPanel((current) => (current === "flights" ? null : "flights"));
+  }, []);
+
+  useEffect(() => {
+    selectFlightFromMapRef.current = showFlight;
+  }, [showFlight]);
+
+  const handlePreviewCoordinate = useCallback(
+    (coordinate: IPriwaCoordinate | null) => {
+      const source = previewLayerRef.current?.getSource();
+      if (!source) return;
+
+      source.clear();
+      if (coordinate) {
+        source.addFeature(createPriwaPreviewFeature(coordinate));
+      }
+    },
+    [],
+  );
+
+  const zoomToCoordinate = useCallback((coordinate: IPriwaCoordinate) => {
+    mapRef.current?.getView().animate({
+      center: fromLonLat([coordinate.lon, coordinate.lat]),
+      zoom: 20,
+      duration: 500,
+    });
+  }, []);
+
+  const zoomToWarnkarte = useCallback(() => {
+    const map = mapRef.current;
+    const layer = warnkarteLayerRef.current;
+    if (!map || !layer) return;
+    fitPriwaWarnkarteLayer(
+      map,
+      layer,
+      getPriwaMapFitPadding(map.getTargetElement()!, isFieldLayout),
+    );
+  }, [isFieldLayout]);
+
+  const zoomToWarnkarteFromSheet = useCallback(() => {
+    zoomToWarnkarte();
+    setActiveMapPanel(null);
+  }, [zoomToWarnkarte]);
+
+  const focusPointOnMap = useCallback(
+    (point: IPriwaPoint) => {
+      selectMatchedMosaicForPoint(point);
+      zoomToCoordinate(point);
+    },
+    [selectMatchedMosaicForPoint, zoomToCoordinate],
+  );
+
+  const focusReviewPointOnMap = useCallback((point: IPriwaPoint) => {
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        const map = mapRef.current;
+        const mapSize = map?.getSize();
+        const view = map?.getView();
+        if (!map || !mapSize || !view) return;
+
+        const zoom = 20;
+        const resolution = view.getResolutionForZoom(zoom);
+        const mapRect = map.getTargetElement()!.getBoundingClientRect();
+        const queueRect = document
+          .querySelector<HTMLElement>("[data-priwa-review-queue-panel]")
+          ?.getBoundingClientRect();
+        const treePanelRect = document
+          .querySelector<HTMLElement>("[data-priwa-review-tree-panel]")
+          ?.getBoundingClientRect();
+        const targetPixel = getPriwaReviewTargetPixel(
+          mapRect,
+          queueRect ?? null,
+          treePanelRect ?? null,
+        );
+        const center = getPriwaReviewMapCenter(
+          fromLonLat([point.lon, point.lat]),
+          mapSize,
+          targetPixel,
+          resolution,
+        );
+        view.animate({ center, zoom, duration: 500 });
+      }),
+    );
+  }, []);
+
+  useEffect(() => {
+    selectReviewItemFromMosaicRef.current = (mosaicId) => {
+      setReviewPointId(null);
+      selectReviewItemFromMosaic(mosaicId);
+    };
+    selectReviewItemFromGroupRef.current = (groupId) => {
+      setReviewPointId(null);
+      selectReviewItemFromGroup(groupId);
+    };
+    selectReviewItemFromPointRef.current = (point) => {
+      setReviewPointId(point.id);
+      selectReviewItemFromPoint(point);
+    };
+  }, [
+    selectReviewItemFromGroup,
+    selectReviewItemFromMosaic,
+    selectReviewItemFromPoint,
+  ]);
+
+  useEffect(() => {
+    if (reviewPointId && !points.some((point) => point.id === reviewPointId)) {
+      setReviewPointId(null);
+    }
+  }, [points, reviewPointId]);
+
+  const selectReviewPoint = useCallback(
+    (point: IPriwaPoint) => {
+      setReviewPointId(point.id);
+      selectReviewItemFromPoint(point);
+      selectMatchedMosaicForPoint(point);
+    },
+    [selectMatchedMosaicForPoint, selectReviewItemFromPoint],
+  );
+
+  const focusSelectedReviewPoint = useCallback(
+    (point: IPriwaPoint) => {
+      selectReviewPoint(point);
+      focusReviewPointOnMap(point);
+    },
+    [focusReviewPointOnMap, selectReviewPoint],
+  );
+
+  const openReviewPointForEditing = useCallback(
+    (point: IPriwaPoint) => {
+      selectReviewPoint(point);
+      requestAnimationFrame(() => openPointForEditing(point));
+    },
+    [openPointForEditing, selectReviewPoint],
+  );
+
+  const openNewPointDrawer = useCallback(() => {
+    setPointListOpen(false);
+    setFormSessionId((currentSessionId) => currentSessionId + 1);
+    setEditingPoint(null);
+    setSelectedCoordinate(null);
+    setSelectedCoordinateSource("qr");
+    setDrawerOpen(true);
+  }, []);
+
+  const requestMapPlacement = useCallback(() => {
+    setPointListOpen(false);
+    setDrawerOpen(false);
+    setMode("place-point");
+  }, [setMode]);
+
+  const cancelMapPlacement = useCallback(() => {
+    setMode("browse");
+    setDrawerOpen(true);
+  }, [setMode]);
+
+  const acceptMapPlacement = useCallback(() => {
+    const center = mapRef.current?.getView().getCenter();
+    if (!center) return;
+
+    const [lon, lat] = toLonLat(center);
+    setSelectedCoordinate({ lat, lon });
+    setSelectedCoordinateSource("map");
+    setMode("browse");
+    setDrawerOpen(true);
+  }, [setMode]);
+
+  const startOfflineAreaSelection = useCallback(() => {
+    setDrawerOpen(false);
+    setPointListOpen(false);
+    setActiveMapPanel("offline");
+    setMode("select-offline-area");
+  }, [setMode]);
+
+  const cancelOfflineAreaSelection = useCallback(() => {
+    setMode("browse");
+    setActiveMapPanel("offline");
+  }, [setMode]);
+
+  const dismissOfflineAreaSelection = useCallback(() => {
+    setMode("browse");
+    setActiveMapPanel(null);
+  }, [setMode]);
+
+  const toggleOfflineMapPanel = useCallback(() => {
+    setActiveMapPanel((current) => (current === "offline" ? null : "offline"));
+  }, []);
+
+  const toggleMapLayersPanel = useCallback(() => {
+    setActiveMapPanel((current) => (current === "layers" ? null : "layers"));
+  }, []);
+
+  const requestDeferredOrientationPermission = useCallback(
+    (event: PointerEvent<HTMLDivElement>) => {
+      if (!userLocation.needsOrientationPermission) return;
+      if (
+        event.target instanceof Element &&
+        event.target.closest("button,[role='button']")
+      )
+        return;
+      if (hasRequestedOrientationFromInteractionRef.current) return;
+
+      hasRequestedOrientationFromInteractionRef.current = true;
+      void locateUser(true);
+    },
+    [locateUser, userLocation.needsOrientationPermission],
+  );
+
+  const hasCenteredUserLocation =
+    userLocation.isTracking &&
+    userLocation.hasFix &&
+    userLocation.hasZoomedToUser;
+  const locationButtonActive =
+    hasCenteredUserLocation &&
+    !userLocation.needsOrientationPermission &&
+    userLocation.isHeadingActive;
+  const locationButtonTitle = userLocation.locationError
+    ? "Standort erneut anfragen"
+    : userLocation.needsOrientationPermission
+      ? "Richtung aktivieren"
+      : userLocation.isLocating
+        ? "Standort wird gesucht"
+        : "Aktuelle Position";
+  const locationHintLabel = userLocation.locationError
+    ? userLocation.locationError
+    : userLocation.needsOrientationPermission
+      ? "Richtung: Standort-Button antippen"
+      : userLocation.isLocating
+        ? "Standort wird angefragt"
+        : null;
+  const handleAddPoint = useCallback(
+    async (point: IPriwaPoint) => {
+      await onAddPoint(point);
+      message.success("Käferbaum gespeichert");
+    },
+    [message, onAddPoint],
+  );
+
+  const handleUpdatePoint = useCallback(
+    async (point: IPriwaPoint) => {
+      await onUpdatePoint(point);
+      message.success("Käferbaum aktualisiert");
+    },
+    [message, onUpdatePoint],
+  );
+
+  const handleDeletePoint = useCallback(
+    async (pointId: string) => {
+      await onDeletePoint(pointId);
+      message.success("Käferbaum gelöscht");
+      setDrawerOpen(false);
+      setEditingPoint(null);
+    },
+    [message, onDeletePoint],
+  );
+
+  const handleCacheBasemapArea = useCallback(
+    async (selectionPlan: IPriwaOfflineSelectionPlan) => {
+      try {
+        const area = await cacheCurrentMapArea(selectionPlan);
+        message.success(
+          `Basiskarte offline gespeichert (${area.cachedTileCount}/${area.tileCount} Kacheln)`,
+        );
+        setMode("browse");
+        setActiveMapPanel("offline");
+      } catch (error) {
+        message.error(
+          error instanceof Error
+            ? error.message
+            : "Basiskarte konnte nicht offline gespeichert werden.",
+        );
+      }
+    },
+    [cacheCurrentMapArea, message, setMode],
+  );
+
+  const handleClearBasemapArea = useCallback(async () => {
+    await clearOfflineBasemapAreas();
+    message.success("Offline-Basiskartenbereiche entfernt");
+  }, [clearOfflineBasemapAreas, message]);
+
+  const handleRefreshBasemapAreas = useCallback(async () => {
+    try {
+      await refreshOfflineBasemapAreas();
+      message.success("Offline-Karten wurden aktualisiert");
+    } catch (error) {
+      message.error(
+        error instanceof Error
+          ? error.message
+          : "Offline-Karten konnten nicht aktualisiert werden.",
+      );
+    }
+  }, [message, refreshOfflineBasemapAreas]);
+
+  const dataErrorMessage =
+    errorMessage ?? groupsErrorMessage ?? cogErrorMessage;
+  const isReviewTreeEditing =
+    !isFieldLayout &&
+    isDrawerOpen &&
+    !!editingPoint &&
+    editingPoint.id === reviewPointId;
+  const closeReviewTree = useCallback(() => {
+    setReviewPointId(null);
+    setDrawerOpen(false);
+    setEditingPoint(null);
+  }, []);
+
+  const offlineStatusControl = (
+    <PriwaOfflineStatus
+      presentation={isFieldLayout ? "map-button" : "status"}
+      active={isOfflineMapModeActive}
+      coverageRatio={offlineViewportCoverageRatio}
+      hasAreas={offlineBasemapAreas.length > 0}
+      isCacheAuditComplete={isOfflineBasemapCacheAuditComplete}
+      isSupported={isOfflineBasemapSupported}
+      needsRefresh={offlineBasemapNeedsRefresh}
+      syncSummary={syncSummary}
+      onToggle={toggleOfflineMapPanel}
+    />
+  );
+
+  return (
+    <div
+      data-testid="priwa-field-map"
+      data-priwa-layout={isFieldLayout ? "field" : "desktop"}
+      data-priwa-flight-panel-placement={
+        isFlightPanelOpen ? flightPanelPlacement : undefined
+      }
+      className="priwa-field-map relative h-full min-h-[100dvh] w-full overflow-hidden bg-neutral-950"
+      onPointerDownCapture={requestDeferredOrientationPermission}
+    >
+      <div ref={containerRef} className="absolute inset-0" />
+
+      {mapInteraction.mode === "browse" && isFieldLayout && (
+        <div
+          className={`priwa-map-control-stack pointer-events-none absolute z-[55] flex flex-col gap-2 transition-[left] ${
+            isFlightSidePanelOpen ? "left-[22.5rem]" : "left-4"
+          }`}
+        >
+          <PriwaMobileFieldTools
+            points={points}
+            groups={groups}
+            isLayersOpen={isMapLayersOpen}
+            isTreeListOpen={isTreeListOpen}
+            onOpenLayers={toggleMapLayersPanel}
+            onOpenTreeList={() => setActiveMapPanel("trees")}
+            onCloseTreeList={() => setActiveMapPanel(null)}
+            onEditPoint={openPointForEditing}
+            onZoomToPoint={focusPointOnMap}
+          />
+          {offlineStatusControl}
+        </div>
+      )}
+
+      {mapInteraction.mode === "browse" && !isFieldLayout && (
+        <div className="priwa-map-control-stack pointer-events-none absolute left-[22.5rem] z-[55] flex flex-col gap-2">
+          <Tooltip title={locationButtonTitle}>
+            <Button
+              className={
+                userLocation.needsOrientationPermission
+                  ? "pointer-events-auto border-amber-500 text-amber-700 shadow-md"
+                  : "pointer-events-auto shadow-md"
+              }
+              type={locationButtonActive ? "primary" : "default"}
+              shape="circle"
+              size="large"
+              icon={
+                userLocation.isLocating ? (
+                  <AimOutlined spin />
+                ) : (
+                  <EnvironmentOutlined />
+                )
+              }
+              onClick={() => userLocation.locateUser(true)}
+              aria-label="Aktuelle Position aktivieren"
+            />
+          </Tooltip>
+          <PriwaBaseLayerControl value={baseLayer} onChange={setBaseLayer} />
+          {additionalMapControl}
+          {!!warnkarteOverlay?.features.length && warnkarteVisible && (
+            <PriwaWarnkarteZoomControl onZoom={zoomToWarnkarte} />
+          )}
+          {!isPointListOpen && !isDrawerOpen && (
+            <Tooltip title="Käferbaum aufnehmen">
+              <Button
+                className="pointer-events-auto shadow-md"
+                shape="circle"
+                size="large"
+                icon={<PlusOutlined />}
+                onClick={openNewPointDrawer}
+                aria-label="Punkt aufnehmen"
+              />
+            </Tooltip>
+          )}
+        </div>
+      )}
+
+      <PriwaMobilePrimaryActions
+        hidden={
+          !isFieldLayout ||
+          isDrawerOpen ||
+          isPointListOpen ||
+          (activeMapPanel !== null && !isFlightSidePanelOpen) ||
+          mapInteraction.mode !== "browse"
+        }
+        isLocating={userLocation.isLocating}
+        locationActive={locationButtonActive}
+        locationLabel={locationButtonTitle}
+        onAddPoint={openNewPointDrawer}
+        onLocate={() => userLocation.locateUser(true)}
+      />
+
+      {isFieldLayout && mapInteraction.mode === "browse" && (
+        <PriwaFieldFlightUi
+          flights={fieldFlights}
+          offline={offlineMosaics}
+          placement={flightPanelPlacement}
+          isPanelOpen={isFlightPanelOpen}
+          isLoading={isCogLoading}
+          isOnline={isOnline}
+          onTogglePanel={toggleFlightPanel}
+          onClosePanel={() => setActiveMapPanel(null)}
+          mapCenter={
+            viewportExtent3857
+              ? toLonLat([
+                  (viewportExtent3857[0] + viewportExtent3857[2]) / 2,
+                  (viewportExtent3857[1] + viewportExtent3857[3]) / 2,
+                ])
+              : null
+          }
+          onFit={fitToFlight}
+        />
+      )}
+
+      {!isFieldLayout && !isPointListOpen && (
+        <PriwaReviewWorkbench
+          items={reviewItems}
+          points={points}
+          mosaics={mosaics}
+          selectedKey={selectedReviewKey}
+          isLoading={isWorkspaceLoading}
+          isSavingGroup={isSavingGroup}
+          isClassifyingFlight={isClassifyingFlight}
+          enabledMosaicIds={enabledMosaicIds}
+          selectedTreeId={reviewPointId}
+          isTreeEditing={isReviewTreeEditing}
+          isHidden={mapInteraction.mode !== "browse"}
+          detailMode={reviewDetailMode}
+          onSelect={selectReviewItem}
+          onOpenData={() => {
+            setReviewPointId(null);
+            setFocusedPointId(null);
+            setPointListOpen(true);
+          }}
+          onCreateGroup={() => {
+            setReviewPointId(null);
+            createGroup();
+          }}
+          onSelectTree={selectReviewPoint}
+          onFocusTree={focusSelectedReviewPoint}
+          onEditTree={openReviewPointForEditing}
+          onCloseTree={closeReviewTree}
+          onEditGroup={setGroupEditorDraft}
+          onSaveGroup={saveGroup}
+          onAssignFlight={assignFlight}
+          onSetMosaicVisibility={setMosaicVisibility}
+          onSetFlightType={setFlightType}
+          onCreateGroupForFlight={createGroupForFlight}
+        />
+      )}
+
+      {isPointListOpen && mapInteraction.mode === "browse" && (
+        <PriwaPointListPanel
+          points={points}
+          groups={groups}
+          mosaics={mosaics}
+          projectName={projectName}
+          isLoading={isLoadingPoints}
+          focusedPointId={focusedPointId}
+          onClose={() => {
+            setFocusedPointId(null);
+            setPointListOpen(false);
+          }}
+          onEditPoint={openPointForEditing}
+          onZoomToPoint={focusPointOnMap}
+        />
+      )}
+
+      {mapInteraction.isPlacingPoint && (
+        <div className="pointer-events-none absolute inset-0 z-[70]">
+          <div className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2">
+            <div className="absolute left-1/2 top-0 h-12 border-l-2 border-white drop-shadow" />
+            <div className="absolute left-0 top-1/2 w-12 border-t-2 border-white drop-shadow" />
+            <div className="absolute left-1/2 top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-emerald-600 bg-white/80" />
+          </div>
+          <div className="pointer-events-auto absolute bottom-4 left-4 right-4 flex gap-2 rounded-md bg-white/95 p-2 shadow-lg backdrop-blur min-[992px]:bottom-5">
+            <Button block onClick={cancelMapPlacement}>
+              Abbrechen
+            </Button>
+            <Button block type="primary" onClick={acceptMapPlacement}>
+              Punkt übernehmen
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {mapInteraction.isSelectingOfflineArea && (
+        <PriwaOfflineAreaSelection
+          plan={offlineSelectionPlan}
+          cacheState={basemapCacheState}
+          isMobile={isFieldLayout}
+          onCancel={cancelOfflineAreaSelection}
+          onDismiss={dismissOfflineAreaSelection}
+          onConfirm={handleCacheBasemapArea}
+        />
+      )}
+
+      {mapInteraction.mode === "browse" && isOfflineMapModeActive && (
+        <PriwaOfflineMapPanel
+          areas={offlineBasemapAreas}
+          readyAreaCount={readyOfflineBasemapAreas.length}
+          cacheState={basemapCacheState}
+          coverageRatio={offlineViewportCoverageRatio}
+          isSupported={isOfflineBasemapSupported}
+          needsRefresh={offlineBasemapNeedsRefresh}
+          syncSummary={syncSummary}
+          isMobile={isFieldLayout}
+          onClose={() => setActiveMapPanel(null)}
+          onStartSelection={startOfflineAreaSelection}
+          onClear={handleClearBasemapArea}
+          onRefresh={handleRefreshBasemapAreas}
+          onSyncNow={onSyncNow}
+        />
+      )}
+
+      <PriwaWarnkarteMapUi
+        isMobile={isFieldLayout}
+        isLayersOpen={mapInteraction.mode === "browse" && isMapLayersOpen}
+        baseLayer={baseLayer}
+        overlay={warnkarteOverlay}
+        isLoading={warnkarteLoading}
+        isVisible={warnkarteVisible}
+        onCloseLayers={() => setActiveMapPanel(null)}
+        onBaseLayerChange={setBaseLayer}
+        onVisibilityChange={onWarnkarteVisibilityChange}
+        onZoom={zoomToWarnkarteFromSheet}
+      />
+
+      {mapInteraction.mode === "browse" && (
+        <div
+          className={`priwa-map-status-stack pointer-events-none absolute z-[55] flex max-w-[calc(100%-5.75rem)] flex-col items-end gap-1.5 ${
+            isFieldLayout ? "right-4" : "right-[24.5rem]"
+          }`}
+        >
+          {locationHintLabel && (
+            <div className="rounded-md bg-white/90 px-2.5 py-1.5 text-xs font-medium text-gray-700 shadow-sm backdrop-blur">
+              {locationHintLabel}
+            </div>
+          )}
+          {!isFieldLayout && offlineStatusControl}
+        </div>
+      )}
+
+      {dataErrorMessage && mapInteraction.mode === "browse" && (
+        <Alert
+          className={`absolute bottom-20 left-4 right-4 z-[55] shadow-lg ${
+            isFieldLayout ? "" : "left-auto w-96"
+          }`}
+          type="error"
+          showIcon
+          message="PRIWA Daten konnten nicht geladen werden"
+          description={dataErrorMessage}
+        />
+      )}
+
+      <PriwaPointDrawer
+        key={formSessionId}
+        isMobile={isMobile}
+        open={isDrawerOpen}
+        formSessionId={formSessionId}
+        editingPoint={editingPoint}
+        selectedCoordinate={selectedCoordinate}
+        selectedCoordinateSource={selectedCoordinateSource}
+        currentUserCoordinate={userLocation.currentCoordinate}
+        onClose={() => {
+          setDrawerOpen(false);
+          setEditingPoint(null);
+        }}
+        onAddPoint={handleAddPoint}
+        onUpdatePoint={handleUpdatePoint}
+        onDeletePoint={handleDeletePoint}
+        isSaving={isSavingPoint}
+        onRequestMapPlacement={requestMapPlacement}
+        onPreviewCoordinate={handlePreviewCoordinate}
+        onZoomToPoint={zoomToCoordinate}
+        presentation={isReviewTreeEditing ? "embedded" : "overlay"}
+      />
+
+      <PriwaBefallsgruppeEditor
+        open={groupEditorDraft !== null}
+        isMobile={isMobile}
+        draft={groupEditorDraft}
+        points={points}
+        mosaics={mosaics.filter((mosaic) => mosaic.flightType !== "not_priwa")}
+        groups={groups}
+        isSaving={isSavingGroup}
+        onClose={() => setGroupEditorDraft(null)}
+        onSave={saveGroup}
+        onDelete={deleteGroup}
+      />
+    </div>
+  );
+}

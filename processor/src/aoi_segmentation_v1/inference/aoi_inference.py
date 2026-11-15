@@ -1,0 +1,359 @@
+"""Full-orthomosaic Area-of-Interest (AOI) inference.
+
+Ports the production OrthoAOI SegFormer-B1 model into the deadtrees processor.
+The model performs binary inside/outside-AOI classification and the pipeline
+returns a single cleaned AOI polygon per orthomosaic.
+
+Reuses the existing segmentation infrastructure:
+- `image_reprojector` to read the ortho in a metric (UTM) CRS so that the
+  polygon cleanup distances below are in metres, matching the production
+  "map-unit" defaults.
+- `InferenceDataset` for padded, overlap-aware tiling (identical to the
+  combined deadwood/treecover model).
+- `mask_to_polygons_scanline` to polygonize the binary mask without ever
+  materialising the full-resolution array.
+"""
+
+import math
+import os
+import tempfile
+import time
+from typing import Callable
+
+import numpy as np
+import rasterio
+import torch
+import torch.nn.functional as F
+from rasterio.enums import Resampling
+from rasterio.features import shapes
+from safetensors import safe_open
+from shapely.geometry import MultiPolygon, Polygon, shape
+from shapely.ops import unary_union
+from transformers import SegformerConfig, SegformerForSemanticSegmentation
+
+from processor.src.utils.inference_dataset import MASK_TIFF_LAYOUT, InferenceDataset, normalize_imagenet, predict_tiles
+from processor.src.utils.segmentation import (
+	filter_polygons_by_area,
+	image_reprojector,
+	mask_to_polygons_scanline,
+	reproject_polygons,
+)
+
+# Binary class indices (config/aoi_segformer.yml in the production package).
+CLASS_OUTSIDE_AOI = 0
+CLASS_INSIDE_AOI = 1
+
+# Tiling matches the combined model so the InferenceDataset windows behave
+# identically: 1024 px tiles with a 256 px padded border that is cropped away.
+TILE_SIZE = 1024
+PADDING = 256
+BATCH_SIZE = 2
+
+# The model expects a fixed 10 cm ground sampling distance, so every ortho is
+# resampled to exactly this resolution (both finer and coarser inputs) when
+# reprojected to its metric UTM CRS.
+INFERENCE_RESOLUTION_M = 0.10
+
+# Polygon cleanup, in metres (we run inference in a metric UTM CRS). These
+# mirror config/evaluation/full_ortho_b1_50epoch_production.yml so the AOI shape
+# matches the validated production output.
+MIN_POLYGON_AREA_M2 = 5.0
+POLYGON_OPENING_RADIUS_M = 5.0
+NEGATIVE_BUFFER_M = -1.5
+SIMPLIFY_TOLERANCE_M = 5.0
+CHAIKIN_ITERATIONS = 1
+# Polygonizing runs on one CPU thread and its time and memory grow with the mask:
+# a 21 Gpx mask took more than five hours and 80 GB. The cleanup works in metres
+# (5 m opening and simplification), so a larger mask is polygonized from an
+# averaged copy of at most this many pixels (0.5 m cells for a 25 Gpx mask).
+MAX_POLYGONIZE_PIXELS = 1_000_000_000
+# Share of tiles between progress log lines during inference.
+PROGRESS_LOG_FRACTION = 0.1
+# Final vertex-thinning pass. The non-expansive clip below re-introduces
+# near-pixel-density vertices along the boundary; a small simplification keeps
+# the shape within 20 cm while cutting the vertex count by ~1-2 orders of
+# magnitude (lighter storage and map rendering).
+FINAL_SIMPLIFY_TOLERANCE_M = 0.20
+
+
+def _build_model_config() -> SegformerConfig:
+	# SegFormer mit-b1 architecture (segformer-b1-finetuned-ade-512-512) with a
+	# 2-class head. Values taken from the bundled HF config.json.
+	return SegformerConfig(
+		num_channels=3,
+		num_encoder_blocks=4,
+		depths=[2, 2, 2, 2],
+		sr_ratios=[8, 4, 2, 1],
+		hidden_sizes=[64, 128, 320, 512],
+		patch_sizes=[7, 3, 3, 3],
+		strides=[4, 2, 2, 2],
+		num_attention_heads=[1, 2, 5, 8],
+		mlp_ratios=[4, 4, 4, 4],
+		hidden_act='gelu',
+		hidden_dropout_prob=0.0,
+		attention_probs_dropout_prob=0.0,
+		classifier_dropout_prob=0.1,
+		initializer_range=0.02,
+		drop_path_rate=0.1,
+		layer_norm_eps=1e-6,
+		decoder_hidden_size=256,
+		num_labels=2,
+		id2label={0: 'outside_aoi', 1: 'inside_aoi'},
+		label2id={'outside_aoi': 0, 'inside_aoi': 1},
+		semantic_loss_ignore_index=255,
+	)
+
+
+def _remove_polygon_holes(geometry):
+	"""Drop interior rings so the AOI is a solid outline."""
+	if geometry is None or geometry.is_empty:
+		return geometry
+	if isinstance(geometry, Polygon):
+		return Polygon(geometry.exterior)
+	if isinstance(geometry, MultiPolygon):
+		return MultiPolygon([Polygon(part.exterior) for part in geometry.geoms if not part.is_empty])
+	return geometry
+
+
+def _keep_largest_polygon(geometry):
+	if geometry is None or geometry.is_empty:
+		return geometry
+	if isinstance(geometry, Polygon):
+		return geometry
+	if isinstance(geometry, MultiPolygon):
+		parts = [part for part in geometry.geoms if not part.is_empty]
+		return max(parts, key=lambda part: part.area) if parts else geometry
+	return geometry
+
+
+def _chaikin_ring(coords: list[tuple[float, float]], iterations: int) -> list[tuple[float, float]]:
+	if iterations <= 0 or len(coords) < 4:
+		return coords
+
+	ring = list(coords)
+	if ring[0] == ring[-1]:
+		ring = ring[:-1]
+
+	for _ in range(iterations):
+		if len(ring) < 3:
+			break
+		smoothed = []
+		for idx, p0 in enumerate(ring):
+			p1 = ring[(idx + 1) % len(ring)]
+			q = (0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1])
+			r = (0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1])
+			smoothed.extend([q, r])
+		ring = smoothed
+
+	ring.append(ring[0])
+	return ring
+
+
+def _chaikin_polygon(polygon: Polygon, iterations: int) -> Polygon:
+	if polygon.is_empty or iterations <= 0:
+		return polygon
+	exterior = _chaikin_ring(list(polygon.exterior.coords), iterations)
+	if len(exterior) < 4:
+		return polygon
+	smoothed = Polygon(exterior)
+	if not smoothed.is_valid:
+		smoothed = smoothed.buffer(0)
+	return smoothed if not smoothed.is_empty else polygon
+
+
+def _smooth_geometry(geometry, simplify_tolerance: float, chaikin_iterations: int):
+	if geometry is None or geometry.is_empty:
+		return geometry
+
+	smoothed = geometry
+	if simplify_tolerance > 0:
+		smoothed = smoothed.simplify(simplify_tolerance, preserve_topology=True)
+	if smoothed.is_empty:
+		return geometry
+
+	if chaikin_iterations > 0:
+		if isinstance(smoothed, Polygon):
+			smoothed = _chaikin_polygon(smoothed, chaikin_iterations)
+		elif isinstance(smoothed, MultiPolygon):
+			parts = [_chaikin_polygon(part, chaikin_iterations) for part in smoothed.geoms if not part.is_empty]
+			smoothed = MultiPolygon([part for part in parts if not part.is_empty])
+	if not smoothed.is_valid:
+		smoothed = smoothed.buffer(0)
+	return smoothed if not smoothed.is_empty else geometry
+
+
+def cleanup_aoi_polygon(polygons: list[Polygon]) -> list[Polygon]:
+	"""Merge per-tile polygons into the single cleaned production AOI shape.
+
+	Steps mirror the production package: union -> drop holes -> morphological
+	opening to remove narrow outward blobs -> inward buffer -> light smoothing
+	clipped back to the opened geometry (non-expansive) -> keep the largest
+	polygon -> drop holes again. Operates in the inference (UTM) CRS, so all
+	distances are metres.
+	"""
+	if not polygons:
+		return []
+
+	geometry = unary_union(polygons)
+	geometry = _remove_polygon_holes(geometry)
+	if geometry is None or geometry.is_empty:
+		return []
+
+	if POLYGON_OPENING_RADIUS_M > 0:
+		opened = geometry.buffer(-POLYGON_OPENING_RADIUS_M).buffer(POLYGON_OPENING_RADIUS_M)
+		if not opened.is_empty:
+			geometry = opened
+	if NEGATIVE_BUFFER_M != 0:
+		buffered = geometry.buffer(NEGATIVE_BUFFER_M)
+		if not buffered.is_empty:
+			geometry = buffered
+
+	non_expansive_reference = geometry
+	geometry = _smooth_geometry(geometry, SIMPLIFY_TOLERANCE_M, CHAIKIN_ITERATIONS)
+	# Clip the smoothed boundary back so smoothing never adds outside-AOI area.
+	geometry = geometry.intersection(non_expansive_reference)
+	if not geometry.is_valid:
+		geometry = geometry.buffer(0)
+
+	geometry = _keep_largest_polygon(geometry)
+	geometry = _remove_polygon_holes(geometry)
+
+	# Thin the dense vertices the clip re-introduced (kept last so it never
+	# expands the AOI beyond the non-expansive reference by more than tolerance).
+	if FINAL_SIMPLIFY_TOLERANCE_M > 0 and geometry is not None and not geometry.is_empty:
+		simplified = geometry.simplify(FINAL_SIMPLIFY_TOLERANCE_M, preserve_topology=True)
+		if not simplified.is_empty:
+			geometry = simplified if simplified.is_valid else simplified.buffer(0)
+
+	if geometry is None or geometry.is_empty:
+		return []
+	if isinstance(geometry, MultiPolygon):
+		return [part for part in geometry.geoms if not part.is_empty]
+	return [geometry]
+
+
+def polygonize_inside_aoi(mask_path: str, log: Callable[..., None]) -> list[Polygon]:
+	"""Return inside-AOI polygons, from an averaged mask when it exceeds MAX_POLYGONIZE_PIXELS."""
+	with rasterio.open(mask_path) as ds:
+		factor = math.ceil(math.sqrt(ds.width * ds.height / MAX_POLYGONIZE_PIXELS))
+		if factor <= 1:
+			log('Polygonizing AOI mask', width=ds.width, height=ds.height)
+			return mask_to_polygons_scanline(ds, CLASS_INSIDE_AOI)
+
+		height, width = math.ceil(ds.height / factor), math.ceil(ds.width / factor)
+		log(
+			'Polygonizing reduced AOI mask',
+			width=ds.width,
+			height=ds.height,
+			reduction_factor=factor,
+			cell_size_m=round(abs(ds.transform.a) * ds.width / width, 3),
+		)
+		# Averaging 0/1 cells keeps a cell inside when most of it was inside.
+		reduced = ds.read(1, out_shape=(height, width), resampling=Resampling.average)
+		transform = ds.transform * ds.transform.scale(ds.width / width, ds.height / height)
+
+	inside = reduced == CLASS_INSIDE_AOI
+	return [shape(geom) for geom, _ in shapes(reduced, mask=inside, transform=transform)]
+
+
+class AOIInference:
+	"""Runs the SegFormer-B1 AOI model and returns the cleaned AOI polygon(s)
+	in the CRS of the input orthomosaic."""
+
+	def __init__(self, model_path: str):
+		torch.set_float32_matmul_precision('high')
+		self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+		self.model = self._load_model(model_path)
+
+	def _load_model(self, model_path: str) -> SegformerForSemanticSegmentation:
+		# The checkpoint was saved from a training wrapper (self.model = ...), so
+		# every key is prefixed with "model.". Strip it before loading, matching
+		# the combined model loader.
+		state_dict = {}
+		with safe_open(model_path, framework='pt', device='cpu') as f:
+			for key in f.keys():
+				new_key = key[len('model.') :] if key.startswith('model.') else key
+				state_dict[new_key] = f.get_tensor(key)
+
+		model = SegformerForSemanticSegmentation(_build_model_config())
+		model.load_state_dict(state_dict, strict=True)
+		model = model.to(self.device)
+		model.eval()
+		return model
+
+	def predict(self, images: torch.Tensor) -> torch.Tensor:
+		"""(B, 3, H, W) uint8 tiles -> (B, H, W) uint8 inside-AOI mask."""
+		logits = self.model(pixel_values=normalize_imagenet(images, torch.float32)).logits
+		logits = F.interpolate(logits, size=images.shape[-2:], mode='bilinear', align_corners=False)
+		return (logits.argmax(dim=1) == CLASS_INSIDE_AOI).to(torch.uint8)
+
+	def inference(self, input_tif: str, log: Callable[..., None] = lambda message, **extra: None) -> list[Polygon]:
+		"""Run inference on a GeoTIFF and return the cleaned AOI polygon(s) in
+		WGS84 (EPSG:4326) lon/lat, ready to store in v2_aois.
+
+		``log(message, **extra)`` receives progress, because the largest orthos
+		run for hours."""
+		# Reproject to a metric (UTM) CRS and resample to the model's fixed 10 cm
+		# grid. Passing the same value as min and max resolution forces exactly
+		# INFERENCE_RESOLUTION_M whether the input is finer or coarser, and the
+		# metric CRS keeps the polygon cleanup buffers expressed in metres.
+		dataset = InferenceDataset(
+			lambda: image_reprojector(
+				input_tif,
+				min_res=INFERENCE_RESOLUTION_M,
+				max_res=INFERENCE_RESOLUTION_M,
+			),
+			tile_size=TILE_SIZE,
+			padding=PADDING,
+		)
+		vrt_src = dataset.image_src
+
+		tmp_mask_path = None
+		try:
+			# Binary mask written tile-by-tile so the full-resolution array never
+			# lives in RAM. predict_tiles forces nodata pixels to outside-AOI (0).
+			with tempfile.NamedTemporaryFile(suffix='_aoi_mask.tif', delete=False) as f:
+				tmp_mask_path = f.name
+
+			tif_kwargs = dict(
+				driver='GTiff',
+				height=dataset.height,
+				width=dataset.width,
+				count=1,
+				dtype=np.uint8,
+				crs=vrt_src.crs,
+				transform=vrt_src.transform,
+				**MASK_TIFF_LAYOUT,
+			)
+			total_tiles = len(dataset)
+			log_every = max(1, math.ceil(total_tiles * PROGRESS_LOG_FRACTION))
+			started = time.monotonic()
+			log('Predicting AOI tiles', tiles=total_tiles, width=dataset.width, height=dataset.height)
+			with rasterio.open(tmp_mask_path, 'w', **tif_kwargs) as dst_mask:
+				predicted = predict_tiles(dataset, self.predict, self.device, BATCH_SIZE, 'aoi inference')
+				for done, (out_window, mask_arr) in enumerate(predicted, start=1):
+					dst_mask.write(mask_arr, 1, window=out_window)
+					if done % log_every == 0:
+						log('AOI tile progress', tiles_done=done, tiles=total_tiles, seconds=round(time.monotonic() - started))
+
+			src_crs = vrt_src.crs
+			vrt_src.close()
+
+			# Polygonize the inside-AOI class without a full-res array, then run the
+			# production polygon cleanup in the metric CRS.
+			started = time.monotonic()
+			inside_polys = polygonize_inside_aoi(tmp_mask_path, log)
+			log('AOI mask polygonized', polygons=len(inside_polys), seconds=round(time.monotonic() - started))
+
+			inside_polys = filter_polygons_by_area(inside_polys, MIN_POLYGON_AREA_M2)
+			cleaned = cleanup_aoi_polygon(inside_polys)
+			if not cleaned:
+				return []
+
+			# Store AOIs in WGS84 lon/lat — that is what v2_aois holds and what the
+			# frontend map renders. The cleanup ran in the metric inference CRS.
+			return reproject_polygons(cleaned, src_crs, 'EPSG:4326')
+
+		finally:
+			if tmp_mask_path and os.path.exists(tmp_mask_path):
+				os.unlink(tmp_mask_path)

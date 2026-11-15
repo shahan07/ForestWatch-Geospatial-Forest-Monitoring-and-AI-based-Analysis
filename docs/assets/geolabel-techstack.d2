@@ -1,0 +1,74 @@
+direction: down
+
+classes: {
+  ui: {
+    style: {
+      fill: "#0f172a"
+      stroke: "#f59e0b"
+      font-color: "#fef3c7"
+      border-radius: 12
+      font-size: 26
+      stroke-width: 2
+      shadow: true
+    }
+  }
+  tiles: {
+    style: {
+      fill: "#0f172a"
+      stroke: "#38bdf8"
+      font-color: "#e0f2fe"
+      border-radius: 12
+      font-size: 26
+      stroke-width: 2
+      shadow: true
+    }
+  }
+  api: {
+    style: {
+      fill: "#0f172a"
+      stroke: "#a78bfa"
+      font-color: "#ede9fe"
+      border-radius: 12
+      font-size: 26
+      stroke-width: 2
+      shadow: true
+    }
+  }
+  db: {
+    style: {
+      fill: "#052e16"
+      stroke: "#22c55e"
+      font-color: "#dcfce7"
+      border-radius: 12
+      font-size: 26
+      stroke-width: 2
+      shadow: true
+    }
+  }
+}
+
+browser: "Map UI\nReact + OpenLayers" { class: ui }
+tiles: "Tile Services\nCOG (nginx)  ·  PostGIS MVT" { class: tiles }
+api: "API  ·  FastAPI\nsave  ·  approve  ·  revert" { class: api }
+database: "PostgreSQL / PostGIS\npredictions  ·  correction table" { class: db }
+
+browser -> tiles: "fetch raster + vector" {
+  style.stroke: "#38bdf8"
+  style.font-color: "#38bdf8"
+  style.stroke-width: 2
+}
+browser -> api: "save / approve / revert" {
+  style.stroke: "#a78bfa"
+  style.font-color: "#a78bfa"
+  style.stroke-width: 2
+}
+tiles -> database: "live query" {
+  style.stroke: "#38bdf8"
+  style.font-color: "#38bdf8"
+  style.stroke-width: 2
+}
+api -> database: "read / write" {
+  style.stroke: "#a78bfa"
+  style.font-color: "#a78bfa"
+  style.stroke-width: 2
+}

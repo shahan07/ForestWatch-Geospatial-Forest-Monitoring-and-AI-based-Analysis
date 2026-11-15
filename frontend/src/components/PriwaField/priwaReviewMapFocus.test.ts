@@ -1,0 +1,105 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  getPriwaFieldFitPadding,
+  getPriwaLeftmostVisibleRect,
+  getPriwaReviewFitPadding,
+  getPriwaReviewMapCenter,
+  getPriwaReviewTargetPixel,
+} from "./priwaReviewMapFocus";
+
+const queue = { left: 16, right: 352, top: 96, bottom: 780 };
+
+describe("PRIWA review map focus", () => {
+  it.each([
+    [1200, 456],
+    [1280, 536],
+    [1440, 696],
+  ])(
+    "keeps a focused tree in the visible map gap at %ipx",
+    (viewportWidth, treePanelLeft) => {
+      const map = { left: 0, right: viewportWidth, top: 0, bottom: 800 };
+      const treePanel = {
+        left: treePanelLeft,
+        right: treePanelLeft + 352,
+        top: 96,
+        bottom: 780,
+      };
+      const target = getPriwaReviewTargetPixel(map, queue, treePanel);
+
+      expect(target.x).toBeGreaterThan(queue.right);
+      expect(target.x).toBeLessThan(treePanel.left);
+
+      const center = getPriwaReviewMapCenter(
+        [1000, 2000],
+        [viewportWidth, 800],
+        target,
+        0.25,
+      );
+      const focusedPixelX = viewportWidth / 2 + (1000 - center[0]) / 0.25;
+      expect(focusedPixelX).toBeCloseTo(target.x);
+    },
+  );
+
+  it("fits overlays into the asymmetric gap between review panels", () => {
+    const map = { left: 0, right: 992, top: 0, bottom: 768 };
+    const detail = { left: 608, right: 976, top: 96, bottom: 748 };
+
+    expect(getPriwaReviewFitPadding(map, queue, detail)).toEqual([
+      96, 400, 120, 368,
+    ]);
+  });
+
+  it("uses the leftmost visible right-side panel", () => {
+    const detail = { left: 1056, right: 1424, top: 96, bottom: 880 };
+    const treeInspector = { left: 688, right: 1040, top: 96, bottom: 880 };
+    const hidden = { left: 0, right: 0, top: 0, bottom: 0 };
+
+    expect(getPriwaLeftmostVisibleRect(detail, hidden, treeInspector)).toEqual(
+      treeInspector,
+    );
+  });
+});
+
+describe("PRIWA field fit padding", () => {
+  const map = { left: 0, right: 1024, top: 0, bottom: 768 };
+
+  it("fits above a still-open compact flight sheet", () => {
+    const portrait = { left: 0, right: 820, top: 0, bottom: 1180 };
+    expect(
+      getPriwaFieldFitPadding(portrait, null, {
+        left: 90,
+        right: 730,
+        top: 684,
+        bottom: 1180,
+      }),
+    ).toEqual([96, 48, 512, 48]);
+  });
+
+  it("keeps the footprint clear of the bottom bar without a side panel", () => {
+    expect(getPriwaFieldFitPadding(map, null)).toEqual([96, 48, 120, 48]);
+  });
+
+  it("shifts the footprint right of an open side flight panel and uses the full height", () => {
+    expect(
+      getPriwaFieldFitPadding(map, {
+        left: 16,
+        right: 344,
+        top: 90,
+        bottom: 748,
+      }),
+    ).toEqual([56, 48, 40, 360]);
+  });
+
+  it("keeps a usable strip on short landscape phones", () => {
+    const phone = { left: 0, right: 844, top: 0, bottom: 250 };
+    const [top, , bottom, left] = getPriwaFieldFitPadding(phone, {
+      left: 16,
+      right: 344,
+      top: 90,
+      bottom: 230,
+    });
+    expect(top + bottom).toBe(90);
+    expect(left).toBe(360);
+  });
+});

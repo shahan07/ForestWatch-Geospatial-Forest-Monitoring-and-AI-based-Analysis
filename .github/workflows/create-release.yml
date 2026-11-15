@@ -1,0 +1,172 @@
+name: Create Release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      target_commitish:
+        description: Branch or commit to tag
+        required: true
+        default: main
+        type: string
+      release_date:
+        description: Base release date in UTC using YYYY.MM.DD; creates vYYYY.MM.DD and appends .N for later releases the same day
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: repo-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.target_commitish || github.sha }}
+          submodules: recursive
+
+      - name: Compute next release tag
+        id: version
+        shell: bash
+        env:
+          RELEASE_DATE_INPUT: ${{ inputs.release_date }}
+        run: |
+          release_date="${RELEASE_DATE_INPUT}"
+          if [ -z "$release_date" ]; then
+            release_date="$(date -u +%Y.%m.%d)"
+          fi
+
+          if ! [[ "$release_date" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]]; then
+            echo "release_date must match YYYY.MM.DD" >&2
+            exit 1
+          fi
+
+          base_tag="v$release_date"
+          target_commitish="$(git rev-parse HEAD)"
+          existing_target_tag="$(
+            git tag --points-at "$target_commitish" --list "${base_tag}*" --sort=-version:refname \
+              | head -n 1
+          )"
+
+          if [ -n "$existing_target_tag" ]; then
+            previous_tag="$existing_target_tag"
+            next_tag="$existing_target_tag"
+          else
+            previous_tag=$(git tag --list "${base_tag}*" --sort=-version:refname | head -n 1)
+            next_tag="$base_tag"
+
+            if [ -n "$previous_tag" ]; then
+              if [ "$previous_tag" = "$base_tag" ]; then
+                next_tag="${base_tag}.1"
+              else
+                suffix="${previous_tag##${base_tag}.}"
+                if ! [[ "$suffix" =~ ^[0-9]+$ ]]; then
+                  echo "Existing CalVer tag has an unexpected suffix: $previous_tag" >&2
+                  exit 1
+                fi
+                next_tag="${base_tag}.$((suffix + 1))"
+              fi
+            fi
+          fi
+
+          {
+            echo "previous_tag=$previous_tag"
+            echo "next_tag=$next_tag"
+            echo "release_date=$release_date"
+            echo "target_commitish=$target_commitish"
+            echo "commit_sha=$(git rev-parse --short=12 HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/deadwood-ai/deadwood-api
+          tags: |
+            type=raw,value=${{ steps.version.outputs.next_tag }}
+            type=raw,value=sha-${{ steps.version.outputs.commit_sha }}
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./api/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Create or reuse GitHub release
+        uses: actions/github-script@v9
+        env:
+          NEXT_TAG: ${{ steps.version.outputs.next_tag }}
+          TARGET_COMMITISH: ${{ steps.version.outputs.target_commitish }}
+        with:
+          script: |
+            let release;
+
+            try {
+              const response = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: process.env.NEXT_TAG,
+              });
+              release = response.data;
+              core.info(`Reusing existing release ${process.env.NEXT_TAG}`);
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              const response = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: process.env.NEXT_TAG,
+                target_commitish: process.env.TARGET_COMMITISH,
+                name: process.env.NEXT_TAG,
+                generate_release_notes: true,
+                draft: false,
+                prerelease: false,
+              });
+              release = response.data;
+            }
+
+            await core.summary
+              .addHeading("Release available")
+              .addTable([
+                [
+                  {data: "Tag", header: true},
+                  {data: "Target", header: true},
+                  {data: "URL", header: true},
+                ],
+                [
+                  process.env.NEXT_TAG,
+                  process.env.TARGET_COMMITISH,
+                  release.html_url,
+                ],
+              ])
+              .write();

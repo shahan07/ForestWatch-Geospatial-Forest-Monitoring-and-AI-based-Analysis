@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LOCK_DIR="${REPO_DIR}/.local/locks"
+LOCK_FILE="${LOCK_DIR}/processor-runtime.lock"
+ACTIVATED_SHA_FILE="${REPO_DIR}/.local/processor-activated-sha"
+PAUSE_FILE="${REPO_DIR}/.local/processor-deploy-paused"
+LOG_FILE="${REPO_DIR}/auto-deploy.log"
+STATUS_SCRIPT="${REPO_DIR}/scripts/processor_runtime_control.py"
+ASSET_PREFLIGHT_SCRIPT="${REPO_DIR}/scripts/processor_asset_preflight.py"
+COMPOSE_FILE="${REPO_DIR}/docker-compose.processor.yaml"
+BRANCH="${PROCESSOR_DEPLOY_BRANCH:-main}"
+DRAIN_TIMEOUT_SECONDS="${PROCESSOR_DRAIN_TIMEOUT_SECONDS:-43200}"
+DRAIN_POLL_SECONDS="${PROCESSOR_DRAIN_POLL_SECONDS:-15}"
+# Exit code of processor_runtime_control.py wait-for-idle when its deadline passes.
+DRAIN_WAIT_TIMEOUT_RC=4
+STARTUP_TIMEOUT_SECONDS="${PROCESSOR_STARTUP_TIMEOUT_SECONDS:-300}"
+READINESS_POLL_SECONDS="${PROCESSOR_READINESS_POLL_SECONDS:-5}"
+UNAVAILABLE_CONFIRMATIONS="${PROCESSOR_UNAVAILABLE_CONFIRMATIONS:-3}"
+UNAVAILABLE_POLL_SECONDS="${PROCESSOR_UNAVAILABLE_POLL_SECONDS:-5}"
+RESUME_DEPLOY=0
+DEPLOY_PHASE="${PROCESSOR_DEPLOY_PHASE:-prepare}"
+DEPLOY_TARGET_SHA="${PROCESSOR_DEPLOY_TARGET_SHA:-}"
+
+if [ "${DEPLOY_PHASE}" = "prepare" ] && { [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--resume" ]; }; }; then
+	echo "Usage: processor_auto_deploy.sh [--resume]" >&2
+	exit 2
+fi
+if [ "${1:-}" = "--resume" ]; then
+	RESUME_DEPLOY=1
+fi
+
+mkdir -p "${LOCK_DIR}"
+if [ ! -e "${LOCK_FILE}" ]; then
+	(umask 000; : > "${LOCK_FILE}")
+fi
+touch "${LOG_FILE}"
+
+log() {
+	printf '%s: %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >> "${LOG_FILE}"
+}
+
+require_head_is_ancestor_of_remote() {
+	local remote_ref="$1"
+	if ! git merge-base --is-ancestor HEAD "${remote_ref}"; then
+		log "Refusing deploy because HEAD contains local commits outside ${remote_ref}"
+		exit 1
+	fi
+}
+
+require_clean_checkout() {
+	local dirty
+	dirty="$(
+		git status --porcelain --untracked-files=all -- \
+			. \
+			':(exclude).local/locks' \
+			':(exclude)auto-deploy.log' \
+			':(exclude)processor-maintenance.log'
+	)"
+	if [ -n "${dirty}" ]; then
+		log "Refusing deploy from dirty checkout: ${dirty//$'\n'/'; '}"
+		exit 1
+	fi
+}
+
+source "${SCRIPT_DIR}/lib/processor_runtime.sh"
+
+processor_asset_mount_matches() {
+	local container_id
+	local mounted_assets
+
+	container_id="$(docker compose "${PROCESSOR_COMPOSE_FILES[@]}" ps -q processor 2>/dev/null || true)"
+	if [ -z "${container_id}" ]; then
+		return 1
+	fi
+	mounted_assets="$(
+		docker inspect "${container_id}" \
+			--format '{{range .Mounts}}{{if eq .Destination "/app/assets"}}{{.Source}}{{end}}{{end}}' \
+			2>/dev/null || true
+	)"
+	[ -n "${mounted_assets}" ] && python3 "${ASSET_PREFLIGHT_SCRIPT}" --mount-matches "${mounted_assets}"
+}
+
+recreate_processor_for_assets() {
+	drain_set=1
+	waiting_for_drain=1
+	wait_for_drain_with_recovery
+	waiting_for_drain=0
+	log_processor_compose_files
+	python3 "${STATUS_SCRIPT}" clear-ack >> "${LOG_FILE}" 2>&1
+	PROCESSOR_RELEASE_SHA="${remote_sha}" \
+		docker compose "${PROCESSOR_COMPOSE_FILES[@]}" up -d --force-recreate processor \
+		>> "${LOG_FILE}" 2>&1
+	python3 "${STATUS_SCRIPT}" wait-for-idle \
+		--expected-release-sha "${remote_sha}" \
+		--timeout-seconds "${STARTUP_TIMEOUT_SECONDS}" \
+		--poll-seconds "${READINESS_POLL_SECONDS}" >> "${LOG_FILE}" 2>&1
+	wait_for_processor_running
+	inspect_processor_runtime
+	python3 "${STATUS_SCRIPT}" record-worker-id >> "${LOG_FILE}" 2>&1
+	python3 "${STATUS_SCRIPT}" clear-drain >> "${LOG_FILE}" 2>&1
+	drain_set=0
+}
+
+if [ "${PROCESSOR_RUNTIME_LOCK_HELD:-0}" != "1" ]; then
+	exec 9<>"${LOCK_FILE}"
+	if ! flock -n 9; then
+		log "Skipping deploy check because another processor runtime operation already holds ${LOCK_FILE}"
+		exit 0
+	fi
+fi
+
+drain_set=0
+waiting_for_drain=0
+on_exit() {
+	local rc=$?
+	trap - EXIT
+	cleanup_processor_runtime_waiter
+	if [ "${rc}" -eq "${DRAIN_WAIT_TIMEOUT_RC}" ] && [ "${waiting_for_drain}" -eq 1 ]; then
+		# The worker is still busy, for example with a very large dataset. That says
+		# nothing about the release, so keep the drain and let the next run keep
+		# waiting. Pausing here would leave the worker drained and idle after its task.
+		log "Worker still busy after ${DRAIN_TIMEOUT_SECONDS}s; keeping the drain, the next run keeps waiting"
+		exit 0
+	fi
+	if [ "${rc}" -ne 0 ] && [ "${drain_set}" -eq 1 ]; then
+		printf 'failed_at=%s head=%s target=%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+			"$(git rev-parse HEAD 2>/dev/null || printf unknown)" "${remote_sha:-unknown}" > "${PAUSE_FILE}.tmp"
+		mv "${PAUSE_FILE}.tmp" "${PAUSE_FILE}"
+		log "Deployment failed; drain remains set and automatic deploy is paused. Fix the target release, then run ./scripts/processor_auto_deploy.sh --resume"
+	fi
+	exit "${rc}"
+}
+trap on_exit EXIT
+
+cd "${REPO_DIR}"
+
+if [ "${DEPLOY_PHASE}" = "activate" ]; then
+	remote_sha="${DEPLOY_TARGET_SHA}"
+	drain_set=1
+	deployed_sha="$(git rev-parse HEAD)"
+	if [ -z "${remote_sha}" ] || [ "${deployed_sha}" != "${remote_sha}" ]; then
+		log "Refusing activation because HEAD ${deployed_sha} does not match target ${remote_sha:-missing}"
+		exit 1
+	fi
+	if ! python3 "${ASSET_PREFLIGHT_SCRIPT}" >> "${LOG_FILE}" 2>&1; then
+		log "Refusing processor activation because required assets are missing"
+		if request_automation_drain "required processor assets missing"; then
+			:
+		elif [ "$?" -eq 3 ]; then
+			log "Preserved existing operator drain while refusing activation"
+		else
+			exit 1
+		fi
+		exit 1
+	fi
+	# Continue below with the target release's freshly loaded activation logic.
+else
+	if [ "${RESUME_DEPLOY}" -eq 1 ]; then
+		if [ -e "${PAUSE_FILE}" ]; then
+			rm "${PAUSE_FILE}"
+			log "Automatic processor deploy resumed; the next cron run will retry while preserving the existing drain"
+		else
+			log "Automatic processor deploy was not paused"
+		fi
+		exit 0
+	fi
+
+	if [ -e "${PAUSE_FILE}" ]; then
+		log "Skipping deploy because automatic processor deploy is paused; inspect ${PAUSE_FILE}"
+		exit 0
+	fi
+
+	require_clean_checkout
+
+	git fetch origin "${BRANCH}" >> "${LOG_FILE}" 2>&1
+	require_head_is_ancestor_of_remote "origin/${BRANCH}"
+
+	local_sha="$(git rev-parse HEAD)"
+	remote_sha="$(git rev-parse "origin/${BRANCH}")"
+	activated_sha="$(cat "${ACTIVATED_SHA_FILE}" 2>/dev/null || true)"
+
+	if [ "${local_sha}" = "${remote_sha}" ] && [ "${activated_sha}" = "${remote_sha}" ]; then
+		if ! python3 "${ASSET_PREFLIGHT_SCRIPT}" >> "${LOG_FILE}" 2>&1; then
+			log "Draining active release because required processor assets are missing"
+			if request_automation_drain "required processor assets missing"; then
+				drain_set=1
+			elif [ "$?" -eq 3 ]; then
+				log "Preserved existing operator drain while required assets are missing"
+			else
+				exit 1
+			fi
+			exit 1
+		fi
+		if ! processor_asset_mount_matches; then
+			log "Recreating processor because the configured asset mount changed"
+			if request_automation_drain "required processor assets missing"; then
+				recreate_processor_for_assets
+				log "Recreated processor with the configured asset mount"
+			elif [ "$?" -eq 3 ]; then
+				log "Preserved existing operator drain while the configured asset mount changed"
+			else
+				exit 1
+			fi
+		elif python3 "${STATUS_SCRIPT}" activation-ready --release-sha "${remote_sha}" >> "${LOG_FILE}" 2>&1; then
+			wait_for_processor_running
+			python3 "${STATUS_SCRIPT}" clear-drain >> "${LOG_FILE}" 2>&1
+			log "Completed interrupted activation for ${remote_sha}"
+		elif python3 "${STATUS_SCRIPT}" asset-recovery-pending >> "${LOG_FILE}" 2>&1; then
+			recreate_processor_for_assets
+			log "Recovered processor after restoring required assets"
+		else
+			log "No changes"
+		fi
+		exit 0
+	fi
+
+	log "Preparing deploy from ${local_sha} to ${remote_sha}"
+
+	if request_automation_drain "auto-deploy ${remote_sha}"; then
+		:
+	elif [ "$?" -eq 3 ]; then
+		log "Skipping deploy because an operator drain is active"
+		exit 0
+	else
+		exit 1
+	fi
+	drain_set=1
+	waiting_for_drain=1
+	wait_for_drain_with_recovery
+	waiting_for_drain=0
+
+	git merge --ff-only "${remote_sha}" >> "${LOG_FILE}" 2>&1
+	deployed_sha="$(git rev-parse HEAD)"
+	if [ "${deployed_sha}" != "${remote_sha}" ]; then
+		log "Refusing deploy because HEAD (${deployed_sha}) does not match fetched ${remote_sha}"
+		exit 1
+	fi
+	require_clean_checkout
+	PROCESSOR_DEPLOY_PHASE=activate \
+		PROCESSOR_DEPLOY_TARGET_SHA="${deployed_sha}" \
+		PROCESSOR_RUNTIME_LOCK_HELD=1 \
+		exec "${REPO_DIR}/scripts/processor_auto_deploy.sh"
+fi
+
+require_clean_checkout
+log_processor_compose_files
+docker compose "${PROCESSOR_COMPOSE_FILES[@]}" build processor >> "${LOG_FILE}" 2>&1
+python3 "${STATUS_SCRIPT}" clear-ack >> "${LOG_FILE}" 2>&1
+PROCESSOR_RELEASE_SHA="${deployed_sha}" docker compose "${PROCESSOR_COMPOSE_FILES[@]}" up -d --force-recreate processor >> "${LOG_FILE}" 2>&1
+python3 "${STATUS_SCRIPT}" wait-for-idle \
+	--expected-release-sha "${deployed_sha}" \
+	--timeout-seconds "${STARTUP_TIMEOUT_SECONDS}" \
+	--poll-seconds "${READINESS_POLL_SECONDS}" >> "${LOG_FILE}" 2>&1
+wait_for_processor_running
+inspect_processor_runtime
+python3 "${STATUS_SCRIPT}" record-worker-id >> "${LOG_FILE}" 2>&1
+
+printf '%s\n' "${deployed_sha}" > "${ACTIVATED_SHA_FILE}.tmp"
+mv "${ACTIVATED_SHA_FILE}.tmp" "${ACTIVATED_SHA_FILE}"
+
+# A long drain can outlast several merges. Clearing the drain now would let the
+# worker claim another long task on this already outdated release, so keep the
+# drain and let the next run roll forward while the worker is still idle. When
+# freshness is unknown (the fetch failed), keep the drain too: the next run
+# either rolls forward or completes this activation and clears it.
+if ! git fetch origin "${BRANCH}" >> "${LOG_FILE}" 2>&1; then
+	drain_set=0
+	log "Activated ${deployed_sha}; could not fetch origin/${BRANCH}, keeping the drain until the next run checks again"
+	exit 0
+fi
+latest_sha="$(git rev-parse "origin/${BRANCH}")"
+if [ "${latest_sha}" != "${deployed_sha}" ]; then
+	drain_set=0
+	log "Activated ${deployed_sha}; origin/${BRANCH} advanced to ${latest_sha}, keeping the drain so the next run rolls forward"
+	exit 0
+fi
+
+python3 "${STATUS_SCRIPT}" clear-drain >> "${LOG_FILE}" 2>&1
+drain_set=0
+
+log "Deployment complete ($(git rev-parse --short HEAD))"

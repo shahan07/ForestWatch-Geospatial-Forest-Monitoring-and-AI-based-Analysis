@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+DEFAULT_EXCLUDE="studio,imgproxy,edge-runtime,logflare,vector,supavisor,realtime,storage-api,mailpit,postgres-meta"
+
+usage() {
+	cat >&2 <<'USAGE'
+Usage: scripts/dev/isolated-supabase.sh <render|start|stop|status|env>
+
+Creates an ignored .local Supabase workdir with unique project_id and ports.
+
+Optional environment overrides:
+  DEADTREES_WORKTREE_SLUG       stable slug used in project/container names
+  DEADTREES_PORT_BASE           base port; offsets are added to this value
+  DEADTREES_ISOLATED_STATE_ROOT state directory, default .local/supabase
+  DEADTREES_SUPABASE_EXCLUDE    comma-separated services to exclude on start
+USAGE
+}
+
+sanitize_slug() {
+	printf '%s' "$1" \
+		| tr '[:upper:]' '[:lower:]' \
+		| tr -cs '[:alnum:]_-' '-' \
+		| sed 's/^-//; s/-$//; s/--*/-/g'
+}
+
+default_slug() {
+	local repo
+	local parent
+	repo="$(basename "$REPO_ROOT")"
+	parent="$(basename "$(dirname "$REPO_ROOT")")"
+	case "$parent" in
+		.|projects|project|src|source|code|repo|repos|repository|repositories|workspace|workspaces|worktrees|*-worktrees)
+			# A shared worktree root (.claude/worktrees/<name>) would give every
+			# worktree the same slug, so they would share containers and ports.
+			sanitize_slug "$repo"
+			;;
+		*)
+			if [[ "$parent" =~ ^[[:alnum:]_-]+$ ]]; then
+				sanitize_slug "$parent"
+			else
+				sanitize_slug "$repo"
+			fi
+			;;
+	esac
+}
+
+default_port_base() {
+	local slug hash
+	slug="$1"
+	hash="$(printf '%s' "$slug" | cksum | awk '{print $1}')"
+	printf '%d\n' "$((56000 + (hash % 80) * 100))"
+}
+
+env_example_value() {
+	local key
+	key="$1"
+	sed -n "s/^${key}=//p" "$REPO_ROOT/.env.example" | tail -n 1
+}
+
+COMMAND="${1:-}"
+if [[ -z "$COMMAND" ]]; then
+	usage
+	exit 1
+fi
+
+# Hosts with a port allocator (the processing server) write this worktree's slug
+# and port band here; the default band can overlap the Linux ephemeral range.
+if [[ -z "${DEADTREES_WORKTREE_SLUG:-}" && -f "$REPO_ROOT/.local/server-env.sh" ]]; then
+	# shellcheck disable=SC1091
+	source "$REPO_ROOT/.local/server-env.sh"
+fi
+
+SLUG="$(sanitize_slug "${DEADTREES_WORKTREE_SLUG:-$(default_slug)}")"
+if [[ -z "$SLUG" ]]; then
+	echo "Could not derive a worktree slug." >&2
+	exit 1
+fi
+# The Supabase CLI truncates project ids ("deadwood-api-<slug>") to 40 characters,
+# which breaks the network name env.sh expects. Keep long slugs unique but short.
+if ((${#SLUG} > 27)); then
+	SLUG="${SLUG:0:20}-$(printf '%s' "$SLUG" | cksum | awk '{printf "%06d", $1 % 1000000}')"
+fi
+
+PORT_BASE="${DEADTREES_PORT_BASE:-$(default_port_base "$SLUG")}"
+if ! [[ "$PORT_BASE" =~ ^[0-9]+$ ]]; then
+	echo "DEADTREES_PORT_BASE must be an integer, got: $PORT_BASE" >&2
+	exit 1
+fi
+
+STATE_ROOT="${DEADTREES_ISOLATED_STATE_ROOT:-$REPO_ROOT/.local/supabase}"
+WORKDIR="$STATE_ROOT/$SLUG"
+SUPABASE_DIR="$WORKDIR/supabase"
+ENV_FILE="$WORKDIR/env.sh"
+CURRENT_ENV_FILE="$STATE_ROOT/current.env"
+PROJECT_ID="deadwood-api-$SLUG"
+EXCLUDE="${DEADTREES_SUPABASE_EXCLUDE:-$DEFAULT_EXCLUDE}"
+DEFAULT_ANON_KEY="$(env_example_value SUPABASE_ANON_KEY)"
+DEFAULT_SERVICE_ROLE_KEY="$(env_example_value SUPABASE_SERVICE_ROLE_KEY)"
+
+if [[ -z "$DEFAULT_ANON_KEY" || -z "$DEFAULT_SERVICE_ROLE_KEY" ]]; then
+	echo "Could not read local Supabase keys from .env.example." >&2
+	exit 1
+fi
+
+PORT_SHADOW="$((PORT_BASE + 20))"
+PORT_SUPABASE_API="$((PORT_BASE + 21))"
+PORT_SUPABASE_DB="$((PORT_BASE + 22))"
+PORT_STUDIO="$((PORT_BASE + 23))"
+PORT_INBUCKET="$((PORT_BASE + 24))"
+PORT_SMTP="$((PORT_BASE + 25))"
+PORT_ANALYTICS="$((PORT_BASE + 27))"
+PORT_POOLER="$((PORT_BASE + 29))"
+PORT_API_HOST="$((PORT_BASE + 17))"
+PORT_PROCESSOR_DEBUG="$((PORT_BASE + 68))"
+PORT_API_DEBUG="$((PORT_BASE + 69))"
+PORT_FRONTEND="$((PORT_BASE + 73))"
+PORT_NGINX_HTTP="$((PORT_BASE + 80))"
+PORT_NGINX_SSH="$((PORT_BASE + 82))"
+PORT_EDGE_INSPECTOR="$((PORT_BASE + 83))"
+
+render() {
+	mkdir -p "$SUPABASE_DIR"
+	cp "$REPO_ROOT/supabase/config.toml" "$SUPABASE_DIR/config.toml"
+	ln -sfn "$REPO_ROOT/supabase/migrations" "$SUPABASE_DIR/migrations"
+	if [[ -f "$REPO_ROOT/supabase/seed.sql" ]]; then
+		ln -sfn "$REPO_ROOT/supabase/seed.sql" "$SUPABASE_DIR/seed.sql"
+	else
+		: > "$SUPABASE_DIR/seed.sql"
+	fi
+
+	perl -0pi -e "
+		s/project_id = \"[^\"]+\"/project_id = \"$PROJECT_ID\"/;
+		s/port = 54321/port = $PORT_SUPABASE_API/g;
+		s/port = 54322/port = $PORT_SUPABASE_DB/g;
+		s/shadow_port = 54320/shadow_port = $PORT_SHADOW/g;
+		s/port = 54329/port = $PORT_POOLER/g;
+		s/port = 54323/port = $PORT_STUDIO/g;
+		s/port = 54324/port = $PORT_INBUCKET/g;
+		s/smtp_port = 54325/smtp_port = $PORT_SMTP/g;
+		s/inspector_port = 8083/inspector_port = $PORT_EDGE_INSPECTOR/g;
+		s/port = 54327/port = $PORT_ANALYTICS/g;
+		s#site_url = \"[^\"]+\"#site_url = \"http://127.0.0.1:$PORT_FRONTEND\"#;
+		s#additional_redirect_urls = \[[^\]]*\]#additional_redirect_urls = [\"http://127.0.0.1:$PORT_FRONTEND\", \"https://127.0.0.1:$PORT_FRONTEND\"]#;
+	" "$SUPABASE_DIR/config.toml"
+
+	cat >> "$SUPABASE_DIR/config.toml" <<EOF
+
+# Generated by scripts/dev/isolated-supabase.sh for the light local QA stack.
+# Supabase's own mailpit/inbucket container is excluded, so Auth sends recovery
+# and confirmation mail to the app Mailpit service exposed on the host.
+[auth.email.smtp]
+enabled = true
+host = "host.docker.internal"
+port = $PORT_SMTP
+user = "mailpit"
+pass = "mailpit"
+admin_email = "qa-local@deadtrees.local"
+sender_name = "DeadTrees Local QA"
+EOF
+
+	if [[ "${CLAUDE_CODE_REMOTE:-}" == "true" ]]; then
+		# Claude cloud VM kernels have no IPv6 and Realtime only listens on inet6.
+		# The light stack excludes Realtime anyway, so skip its schema init too.
+		sed -i '/^\[realtime\]/,/^enabled/s/^enabled = true/enabled = false/' "$SUPABASE_DIR/config.toml"
+	fi
+
+	cat > "$ENV_FILE" <<EOF
+DEADTREES_ISOLATED_ENV_FILE=$ENV_FILE
+DEADTREES_ISOLATED_SLUG=$SLUG
+DEADTREES_PORT_BASE=$PORT_BASE
+SUPABASE_WORKDIR=$WORKDIR
+SUPABASE_PROJECT_ID=$PROJECT_ID
+SUPABASE_EXCLUDE_LIGHT=$EXCLUDE
+
+SUPABASE_URL=http://127.0.0.1:$PORT_SUPABASE_API
+SUPABASE_URL_DOCKER=http://host.docker.internal:$PORT_SUPABASE_API
+SUPABASE_DB_URL=postgresql://postgres:postgres@127.0.0.1:$PORT_SUPABASE_DB/postgres
+SUPABASE_DB_URL_DOCKER=postgresql://postgres:postgres@host.docker.internal:$PORT_SUPABASE_DB/postgres
+SUPABASE_ANON_KEY=$DEFAULT_ANON_KEY
+SUPABASE_KEY=$DEFAULT_SERVICE_ROLE_KEY
+SUPABASE_SERVICE_ROLE_KEY=$DEFAULT_SERVICE_ROLE_KEY
+
+VITE_SUPABASE_URL=http://127.0.0.1:$PORT_SUPABASE_API
+VITE_SUPABASE_ANON_KEY=$DEFAULT_ANON_KEY
+VITE_LOCAL_STORAGE_SERVER_URL=http://localhost:$PORT_NGINX_HTTP
+VITE_LOCAL_API_URL=http://localhost:$PORT_NGINX_HTTP/api/v1
+
+LOCAL_FRONTEND_PORT=$PORT_FRONTEND
+LOCAL_DATA_ROOT=$REPO_ROOT/.local/qa-data
+PLAYWRIGHT_PORT=$PORT_FRONTEND
+PLAYWRIGHT_BASE_URL=http://127.0.0.1:$PORT_FRONTEND
+LOCAL_API_HOST_PORT=$PORT_API_HOST
+LOCAL_API_DEBUG_PORT=$PORT_API_DEBUG
+LOCAL_PROCESSOR_DEBUG_PORT=$PORT_PROCESSOR_DEBUG
+LOCAL_NGINX_HTTP_PORT=$PORT_NGINX_HTTP
+LOCAL_NGINX_SSH_PORT=$PORT_NGINX_SSH
+LOCAL_MAILPIT_HTTP_PORT=$PORT_INBUCKET
+LOCAL_MAILPIT_SMTP_PORT=$PORT_SMTP
+NGINX_COG_URL=http://localhost:$PORT_NGINX_HTTP/cogs/v1
+
+COMPOSE_PROJECT_NAME=deadtrees-test-$SLUG
+COMPOSE_NETWORK_NAME=deadwood_network_$SLUG
+EOF
+	if [[ "${CLAUDE_CODE_REMOTE:-}" == "true" ]]; then
+		printf 'COMPOSE_FILE=%s\n' "$("$REPO_ROOT/scripts/setup-cloud.sh" compose-override)" >> "$ENV_FILE"
+	fi
+	ln -sfn "$ENV_FILE" "$CURRENT_ENV_FILE"
+
+	# Plain `docker compose` reads the repo .env; point it at this worktree's project and
+	# network so it cannot recreate or join containers of the shared default project.
+	if [[ -f "$REPO_ROOT/.env" ]]; then
+		local tmp_env="$REPO_ROOT/.env.tmp.$$"
+		grep -Ev '^(COMPOSE_PROJECT_NAME|COMPOSE_NETWORK_NAME)=' "$REPO_ROOT/.env" > "$tmp_env" || true
+		grep -E '^(COMPOSE_PROJECT_NAME|COMPOSE_NETWORK_NAME)=' "$ENV_FILE" >> "$tmp_env"
+		# Rewrite in place so the .env keeps its permissions.
+		cat "$tmp_env" > "$REPO_ROOT/.env"
+		rm -f "$tmp_env"
+	fi
+
+	echo "Rendered isolated Supabase config:"
+	echo "  workdir: $WORKDIR"
+	echo "  env:     $ENV_FILE"
+	echo "  API:     http://127.0.0.1:$PORT_SUPABASE_API"
+	echo "  DB:      postgresql://postgres:postgres@127.0.0.1:$PORT_SUPABASE_DB/postgres"
+}
+
+case "$COMMAND" in
+	render)
+		render
+		;;
+	start)
+		render
+		if [[ "${CLAUDE_CODE_REMOTE:-}" == "true" ]]; then
+			# Claude cloud VMs share egress: public.ecr.aws answers "Data limit
+			# exceeded" and Docker Hub 429, so pull Supabase images from ghcr.io.
+			export SUPABASE_INTERNAL_IMAGE_REGISTRY="${SUPABASE_INTERNAL_IMAGE_REGISTRY:-ghcr.io}"
+		fi
+		supabase start --workdir "$WORKDIR" -x "$EXCLUDE"
+		;;
+	stop)
+		if [[ ! -d "$WORKDIR" ]]; then
+			echo "No isolated Supabase workdir found for slug '$SLUG': $WORKDIR" >&2
+			exit 1
+		fi
+		supabase stop --workdir "$WORKDIR"
+		;;
+	status)
+		if [[ ! -d "$WORKDIR" ]]; then
+			echo "No isolated Supabase workdir found for slug '$SLUG': $WORKDIR" >&2
+			exit 1
+		fi
+		supabase status --workdir "$WORKDIR"
+		;;
+	env)
+		render >/dev/null
+		printf '%s\n' "$ENV_FILE"
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac

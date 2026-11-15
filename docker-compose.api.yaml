@@ -1,0 +1,80 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:40831:40831
+      # - 2222:22  # Expose SSH port
+    volumes:
+      - /data:/data
+      - ./assets/gadm/gadm_410.gpkg:/gadm_data/gadm_410.gpkg
+      - ~/.ssh/authorized_keys:/home/dendro/.ssh/authorized_keys:ro
+    
+    healthcheck:
+      test: curl --fail http://127.0.0.1:40831/ || exit 1
+      interval: 1m
+      timeout: 10s
+      retries: 5
+      start_period: 1m30s
+      start_interval: 1s
+
+    environment:
+      BASE_DIR: /data
+      PYTHONPATH: /app
+      # Persist the OpenCLIP text-encoder weights on the /data mount so the
+      # ~3.9GB download happens once and survives container restarts.
+      OPENCLIP_CACHE_DIR: /data/assets/openclip_cache
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_KEY: ${SUPABASE_KEY}
+      DEV_MODE: false
+      GADM_DATA_PATH: /gadm_data/gadm_410.gpkg
+      UVICORN_ROOT_PATH: /api/v1
+      UVICORN_PORT: 40831
+      UVICORN_HOST: 0.0.0.0
+      # Host nginx reaches the API through Docker's bridge gateway, so only
+      # trusted proxy peers may supply X-Real-IP for client IP resolution
+      # (search and download rate limits, prepackaged grant audit rows). Host
+      # nginx applies the primary public edge limit; this preserves per-client
+      # backend buckets across Docker gateway subnets.
+      SEARCH_RATE_LIMIT_TRUSTED_PROXIES: ${SEARCH_RATE_LIMIT_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12}
+      # Reference export configuration
+      REFERENCE_EXPORT_UUID: ${REFERENCE_EXPORT_UUID}
+      NGINX_COG_URL: ${NGINX_COG_URL}
+      DEADTREES_USER: ${DEADTREES_USER}
+      DEADTREES_PASSWORD: ${DEADTREES_PASSWORD}
+      # Prepackaged dataset signed download configuration
+      PREPACKAGED_S3_ENDPOINT_URL: ${PREPACKAGED_S3_ENDPOINT_URL:-}
+      PREPACKAGED_S3_REGION: ${PREPACKAGED_S3_REGION:-fr1-ec82}
+      PREPACKAGED_S3_BUCKET: ${PREPACKAGED_S3_BUCKET:-frct-deadtrees-products}
+      PREPACKAGED_API_READ_S3_ACCESS_KEY: ${PREPACKAGED_API_READ_S3_ACCESS_KEY:-}
+      PREPACKAGED_API_READ_S3_SECRET_KEY: ${PREPACKAGED_API_READ_S3_SECRET_KEY:-}
+      PREPACKAGED_SIGNED_URL_TTL_SECONDS: ${PREPACKAGED_SIGNED_URL_TTL_SECONDS:-86400}
+      # Service role key for accessing auth.users (user email lookup)
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      # Daily summary: PostHog integration
+      POSTHOG_API_KEY: ${POSTHOG_API_KEY:-}
+      POSTHOG_PROJECT_ID: ${POSTHOG_PROJECT_ID:-}
+      POSTHOG_HOST: ${POSTHOG_HOST:-https://eu.posthog.com}
+      # Daily summary: Zulip integration
+      ZULIP_EMAIL: ${ZULIP_EMAIL:-}
+      ZULIP_API_KEY: ${ZULIP_API_KEY:-}
+      ZULIP_SITE: ${ZULIP_SITE:-}
+      ZULIP_STREAM: ${ZULIP_STREAM:-project_deadtree.earth}
+      ZULIP_TOPIC: ${ZULIP_TOPIC:-Daily Summary}
+      # Daily summary: Linear integration
+      LINEAR_ENABLED: ${LINEAR_ENABLED:-true}
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-}
+      LINEAR_TEAM_ID: ${LINEAR_TEAM_ID:-ba4011bf-0b5c-4631-9f88-1034ab4ef541}
+      BREVO_API_KEY: ${BREVO_API_KEY:-}
+      NOTIFICATION_SENDER_EMAIL: ${NOTIFICATION_SENDER_EMAIL:-notifications@deadtrees.earth}
+      NOTIFICATION_SENDER_NAME: ${NOTIFICATION_SENDER_NAME:-DeadTrees}
+      # Cloudflare Turnstile secret for the sign-up captcha
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+
+    # command: python run.py server --reload=False
+
+  # NOTE:
+  # NGINX runs on the host (systemd) on the production storage server.
+  # This compose file only manages the API container to avoid port conflicts on 80/443.

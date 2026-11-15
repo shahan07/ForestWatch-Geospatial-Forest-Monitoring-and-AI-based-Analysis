@@ -1,0 +1,52 @@
+{
+  "name": "deadtrees.earth",
+  "short_name": "deadtrees",
+  "description": "Mobile map for exploring and contributing dead-tree observations.",
+  "start_url": "/deadtrees",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f172a",
+  "theme_color": "#1b5e35",
+  "icons": [
+    {
+      "src": "/assets/app-icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/assets/favicon.png",
+      "sizes": "356x430",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "DeadTrees map",
+      "short_name": "Map",
+      "url": "/deadtrees",
+      "icons": [
+        {
+          "src": "/assets/app-icon.png",
+          "sizes": "512x512",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "PRIWA Field",
+      "short_name": "PRIWA",
+      "url": "/priwa-field",
+      "icons": [
+        {
+          "src": "/assets/app-icon.png",
+          "sizes": "512x512",
+          "type": "image/png"
+        }
+      ]
+    }
+  ]
+}
